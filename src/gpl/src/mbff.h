@@ -23,7 +23,7 @@ namespace rsz {
 class Resizer;
 }
 
-namespace sta {
+namespace sta {  
 class dbNetwork;
 class dbSta;
 class FuncExpr;

@@ -28,6 +28,19 @@ using gpl::Replace;
 
 %inline %{
 
+// -----------------------------------------------------------------------
+
+void 
+replace_run_cluster_flip_flops_cmd(int num_paths_per_endpoint, bool debug)
+{
+Replace* replace = getReplace();
+int threads = ord::OpenRoad::openRoad()->getThreadCount();
+replace->doClusterFlipFlops(num_paths_per_endpoint, threads, debug);
+}
+
+// -----------------------------------------------------------------------
+
+
 void
 placement_cluster_cmd(const std::vector<odb::dbInst*>& cluster)
 {
@@ -57,16 +70,6 @@ replace_nesterov_place_cmd()
   int threads = ord::OpenRoad::openRoad()->getThreadCount();
   replace->doNesterovPlace(threads);
 }
-
-
-void
-replace_run_mbff_cmd(int max_sz, float alpha, float beta, int num_paths) 
-{
-  Replace* replace = getReplace();
-  int threads = ord::OpenRoad::openRoad()->getThreadCount();
-  replace->runMBFF(max_sz, alpha, beta, threads, num_paths);   
-}
-
 
 void
 set_density_cmd(float density)

@@ -39,7 +39,7 @@ target_sources(gpl
     src/timingBase.cpp
     src/graphics.cpp
     src/solver.cpp
-    src/mbff.cpp
+    src/aggloCluster.cpp
 )
 
 messages(TARGET gpl)
@@ -76,7 +76,7 @@ if (Python3_FOUND AND BUILD_PYTHON)
   target_include_directories(gpl_py
     PUBLIC
       include
-      
+
   )
 
   target_link_libraries(gpl_py

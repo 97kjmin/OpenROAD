@@ -3,6 +3,9 @@
 
 #pragma once
 
+#include <sstream>
+#include <string>
+
 namespace gpl {
 
 class FloatPoint
@@ -12,6 +15,12 @@ class FloatPoint
   float y = 0;
   FloatPoint() = default;
   FloatPoint(float x, float y) : x(x), y(y) {}
+  std::string to_string() const
+  {
+    std::ostringstream oss;
+    oss << "(" << x << ", " << y << ")";
+    return oss.str();
+  }
 };
 
 }  // namespace gpl

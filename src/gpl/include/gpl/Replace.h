@@ -39,6 +39,7 @@ class TimingBase;
 
 class InitialPlace;
 class NesterovPlace;
+class AggloCluster;
 
 using Cluster = std::vector<odb::dbInst*>;
 using Clusters = std::vector<Cluster>;
@@ -57,10 +58,15 @@ class Replace
 
   void doIncrementalPlace(int threads);
   void doInitialPlace(int threads);
-  void runMBFF(int max_sz, float alpha, float beta, int threads, int num_paths);
 
   void addPlacementCluster(const Cluster& cluster);
   int doNesterovPlace(int threads, int start_iter = 0);
+
+// -----------------------------------------------------------------------
+  
+  void doClusterFlipFlops(int num_paths_per_endpoint, int threads, bool debug);
+
+// -----------------------------------------------------------------------
 
   // Initial Place param settings
   void setInitialPlaceMaxIter(int iter);
@@ -122,6 +128,13 @@ class Replace
                 std::string images_path);
 
  private:
+
+// -----------------------------------------------------------------------
+  
+  std::unique_ptr<AggloCluster> ac_;
+
+// -----------------------------------------------------------------------
+
   bool initNesterovPlace(int threads);
 
   odb::dbDatabase* db_ = nullptr;

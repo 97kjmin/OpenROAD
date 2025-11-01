@@ -9,10 +9,10 @@
 #include <string>
 #include <utility>
 
+#include "aggloCluster.h"
 #include "db_sta/dbNetwork.hh"
 #include "db_sta/dbSta.hh"
 #include "initialPlace.h"
-#include "mbff.h"
 #include "nesterovBase.h"
 #include "nesterovPlace.h"
 #include "odb/db.h"
@@ -42,6 +42,7 @@ void Replace::reset()
 {
   ip_.reset();
   np_.reset();
+  ac_.reset();
 
   pbc_.reset();
   nbc_.reset();
@@ -220,15 +221,19 @@ void Replace::doInitialPlace(int threads)
   ip_->doBicgstabPlace(threads);
 }
 
-void Replace::runMBFF(int max_sz,
-                      float alpha,
-                      float beta,
-                      int threads,
-                      int num_paths)
+// -----------------------------------------------------------------------
+
+void Replace::doClusterFlipFlops(int num_paths_per_endpoint, int threads, bool debug)
 {
-  MBFF pntset(db_, sta_, log_, rs_, threads, 20, num_paths, gui_debug_);
-  pntset.Run(max_sz, alpha, beta);
+  log_->info(GPL, 9989, "Execute clustering of flip-flops.");
+
+  std::unique_ptr<AggloCluster> ag(new AggloCluster(
+      db_, sta_, log_, rs_, num_paths_per_endpoint, threads));
+  ac_ = std::move(ag);
+  ac_->doAggloCluster(debug);
 }
+
+// -----------------------------------------------------------------------
 
 bool Replace::initNesterovPlace(int threads)
 {

@@ -1,6 +1,39 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Copyright (c) 2018-2025, The OpenROAD Authors
 
+# -----------------------------------------------------------------------
+
+sta::define_cmd_args "cluster_flip_flops" {\
+    [-num_paths_per_endpoint]\
+    [-debug]
+}
+
+proc cluster_flip_flops { args } {
+  sta::parse_key_args "cluster_flip_flops" args \
+    keys { -num_paths_per_endpoint } \
+    flags { -debug }
+
+  if { [ord::get_db_block] == "NULL" } {
+    utl::error GPL 9990 "No design block found."
+  }
+
+  set num_paths_per_endpoint 50
+  set debug 0
+
+  if { [info exists keys(-num_paths_per_endpoint)] } {
+    set num_paths_per_endpoint $keys(-num_paths_per_endpoint)
+    sta::check_positive_integer "-num_paths_per_endpoint" $num_paths_per_endpoint
+  }
+
+  if { [info exists flags(-debug)] } {
+    set debug 1 
+  }
+
+  gpl::replace_run_cluster_flip_flops_cmd $num_paths_per_endpoint $debug
+}
+
+# -----------------------------------------------------------------------
+
 sta::define_cmd_args "global_placement" {\
     [-skip_initial_place]\
     [-skip_nesterov_place]\
@@ -312,47 +345,6 @@ proc global_placement { args } {
   } else {
     utl::error GPL 130 "No rows defined in design. Use initialize_floorplan to add rows."
   }
-}
-
-
-sta::define_cmd_args "cluster_flops" {\
-    [-tray_weight tray_weight]\
-    [-timing_weight timing_weight]\
-    [-max_split_size max_split_size]\
-    [-num_paths num_paths]\
-}
-
-proc cluster_flops { args } {
-  sta::parse_key_args "cluster_flops" args \
-    keys { -tray_weight -timing_weight -max_split_size -num_paths } \
-    flags {}
-
-  if { [ord::get_db_block] == "NULL" } {
-    utl::error GPL 113 "No design block found."
-  }
-
-  set tray_weight 32.0
-  set timing_weight 0.1
-  set max_split_size 500
-  set num_paths 0
-
-  if { [info exists keys(-tray_weight)] } {
-    set tray_weight $keys(-tray_weight)
-  }
-
-  if { [info exists keys(-timing_weight)] } {
-    set timing_weight $keys(-timing_weight)
-  }
-
-  if { [info exists keys(-max_split_size)] } {
-    set max_split_size $keys(-max_split_size)
-  }
-
-  if { [info exists keys(-num_paths)] } {
-    set num_paths $keys(-num_paths)
-  }
-
-  gpl::replace_run_mbff_cmd $max_split_size $tray_weight $timing_weight $num_paths
 }
 
 proc global_placement_debug { args } {
