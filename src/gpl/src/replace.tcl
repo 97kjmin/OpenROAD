@@ -4,13 +4,15 @@
 # -----------------------------------------------------------------------
 
 sta::define_cmd_args "cluster_flip_flops" {\
-    [-num_paths_per_endpoint]\
+    [-num_paths_per_endpoint num_paths]\
+    [-density density]\
+    [-overflow overflow]\
     [-debug]
 }
 
 proc cluster_flip_flops { args } {
   sta::parse_key_args "cluster_flip_flops" args \
-    keys { -num_paths_per_endpoint } \
+    keys { -num_paths_per_endpoint -density -overflow } \
     flags { -debug }
 
   if { [ord::get_db_block] == "NULL" } {
@@ -18,6 +20,8 @@ proc cluster_flip_flops { args } {
   }
 
   set num_paths_per_endpoint 50
+  set density 0.7
+  set overflow 0.1
   set debug 0
 
   if { [info exists keys(-num_paths_per_endpoint)] } {
@@ -25,11 +29,21 @@ proc cluster_flip_flops { args } {
     sta::check_positive_integer "-num_paths_per_endpoint" $num_paths_per_endpoint
   }
 
+  if { [info exists keys(-density)] } {
+    set density $keys(-density)
+    sta::check_positive_float "-density" $density
+  }
+
+  if { [info exists keys(-overflow)] } {
+    set overflow $keys(-overflow)
+    sta::check_positive_float "-overflow" $overflow
+  }
+
   if { [info exists flags(-debug)] } {
     set debug 1 
   }
 
-  gpl::replace_run_cluster_flip_flops_cmd $num_paths_per_endpoint $debug
+  gpl::replace_run_cluster_flip_flops_cmd $num_paths_per_endpoint $density $overflow $debug
 }
 
 # -----------------------------------------------------------------------

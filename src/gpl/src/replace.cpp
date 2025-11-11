@@ -223,14 +223,19 @@ void Replace::doInitialPlace(int threads)
 
 // -----------------------------------------------------------------------
 
-void Replace::doClusterFlipFlops(int num_paths_per_endpoint, int threads, bool debug)
+void Replace::doClusterFlipFlops(int num_paths_per_endpoint,
+                                 float density,
+                                 float overflow,
+                                 int threads,
+                                 bool verbose)
 {
   log_->info(GPL, 9989, "Execute clustering of flip-flops.");
 
   std::unique_ptr<AggloCluster> ag(new AggloCluster(
-      db_, sta_, log_, rs_, num_paths_per_endpoint, threads));
+      db_, sta_, log_, rs_, density, overflow, num_paths_per_endpoint, threads, verbose));
   ac_ = std::move(ag);
-  ac_->doAggloCluster(debug);
+
+  ac_->doAggloCluster();
 }
 
 // -----------------------------------------------------------------------
