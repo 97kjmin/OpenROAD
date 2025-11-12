@@ -771,17 +771,9 @@ class AggloCluster
     // ╚═══════════════════════════════════════════════════════════════════╝
     
     // [Level 1] Top-level: Compute feasible region for each flop unit
-    void calcFeasibleRegion(FlopUnit& flop, bool verbose = false, double unit_r=7.5e5, double unit_c=16e-12);
+    void calcFeasibleRegion(FlopUnit& flop, bool verbose = false);
     
     // [Level 2] Main processing functions for different pin types
-    struct PinClassification {
-      std::vector<odb::dbITerm*> d_pins;
-      std::vector<odb::dbITerm*> q_pins;
-      std::vector<odb::dbITerm*> qn_pins;
-      odb::dbITerm* clk_pin;
-    };
-    
-    PinClassification classifyFlopPins(odb::dbInst* inst) const;
     void processFanOutPin(FlopUnit& flop, odb::dbITerm* out_pin, odb::dbMTerm* clk_pin_lib, est::EstimateParasitics* est, double unit_r, double unit_c, bool verbose = false);
     void processFanInPin(FlopUnit& flop, odb::dbITerm* in_pin, est::EstimateParasitics* est, double unit_r, double unit_c, bool verbose = false);
     void computeFinalFeasibleRegion(FlopUnit& flop, const std::vector<odb::dbITerm*>& all_pins, bool verbose = false);
@@ -861,6 +853,10 @@ class AggloCluster
     // ╔═══════════════════════════════════════════════════════════════════╗
     // ║ General Utilities (used across multiple phases)                   ║
     // ╚═══════════════════════════════════════════════════════════════════╝
+
+    // Unit conversion
+    double dbuToMeters(int dist) const;
+    int metersToDbu(double dist) const;
 
     // Coordinate transformation
     Point transformCoords(const Point& p) const;
