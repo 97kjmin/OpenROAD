@@ -1939,18 +1939,15 @@ AggloCluster::getPortType(const sta::LibertyPort* lib_port, odb::dbInst* inst) c
 // -----------------------------------------------------------------------------
 
 void
-AggloCluster::calcFeasibleRegion(FlopUnit& flop, 
-                                 bool verbose)
+AggloCluster::calcFeasibleRegion(FlopUnit& flop, bool verbose)
 {
-  // Set precision for floating point output
   if (verbose) {
     std::cout << std::fixed << std::setprecision(18);
   }
 
-  auto est = resizer_->getEstimateParasitics();
-  
-  double unit_c = est->wireSignalCapacitance(corner_);
-  double unit_r = est->wireSignalResistance(corner_);
+  const auto est = resizer_->getEstimateParasitics();
+  const double unit_c = est->wireSignalCapacitance(corner_);
+  const double unit_r = est->wireSignalResistance(corner_);
 
   if (verbose) {
     std::cout << "\n=== Calculating Feasible Region for Flop: " << flop.inst_->getName() << " ===" << std::endl;
@@ -1959,12 +1956,8 @@ AggloCluster::calcFeasibleRegion(FlopUnit& flop,
     std::cout << "    Unit capacitance: " << unit_c << std::endl;
   }
 
-  //----------------------------------------------------------------------------
-  // Step 2: Classify pins
-  //----------------------------------------------------------------------------
-  std::vector<odb::dbITerm*> d_pins;
-  std::vector<odb::dbITerm*> q_pins;
-  std::vector<odb::dbITerm*> qn_pins;
+  // Classify pins
+  std::vector<odb::dbITerm*> d_pins, q_pins, qn_pins;
   odb::dbITerm* clk_pin = nullptr;
   
   for (odb::dbITerm* iterm : flop.inst_->getITerms()) {
@@ -2003,30 +1996,24 @@ AggloCluster::calcFeasibleRegion(FlopUnit& flop,
     return;
   }
   
-  odb::dbMTerm* clk_pin_lib = clk_pin->getMTerm();
-  
-  //----------------------------------------------------------------------------
-  // Step 3: Process Fan-Out pins (Q and QN)
-  //----------------------------------------------------------------------------
+  // Process output pins
   std::vector<odb::dbITerm*> output_pins;
+  output_pins.reserve(q_pins.size() + qn_pins.size());
   output_pins.insert(output_pins.end(), q_pins.begin(), q_pins.end());
   output_pins.insert(output_pins.end(), qn_pins.begin(), qn_pins.end());
   
   for (odb::dbITerm* out_pin : output_pins) {
-    processFanOutPin(flop, out_pin, clk_pin_lib, est, unit_r, unit_c, verbose);
+    processFanOutPin(flop, out_pin, clk_pin->getMTerm(), est, unit_r, unit_c, verbose);
   }
 
-  //----------------------------------------------------------------------------
-  // Step 4: Process Fan-In pins (D pins)
-  //----------------------------------------------------------------------------
+  // Process input pins
   for (odb::dbITerm* d_pin : d_pins) {
     processFanInPin(flop, d_pin, est, unit_r, unit_c, verbose);
   }
   
-  //----------------------------------------------------------------------------
-  // Step 5: Compute final feasible region
-  //----------------------------------------------------------------------------
+  // Compute final feasible region from all pins
   std::vector<odb::dbITerm*> all_pins;
+  all_pins.reserve(d_pins.size() + q_pins.size() + qn_pins.size());
   all_pins.insert(all_pins.end(), d_pins.begin(), d_pins.end());
   all_pins.insert(all_pins.end(), q_pins.begin(), q_pins.end());
   all_pins.insert(all_pins.end(), qn_pins.begin(), qn_pins.end());
@@ -2052,8 +2039,8 @@ AggloCluster::processFanOutPin(FlopUnit& flop,
     std::cout << "\n  [Step 3.1] Processing Fan-Out Pin: " << out_pin->getMTerm()->getName() << std::endl;
   }
   
-  // Step 1: Check if pin has timing constraints
-  auto budget_it = flop.pin_budgets_.find(out_pin);
+  // Check timing constraints
+  const auto budget_it = flop.pin_budgets_.find(out_pin);
   if (budget_it == flop.pin_budgets_.end() || budget_it->second.empty()) {
     if (verbose) {
       std::cout << "    No timing constraints found" << std::endl;
@@ -2067,7 +2054,7 @@ AggloCluster::processFanOutPin(FlopUnit& flop,
     std::cout << "    Total timing paths for this pin: " << budget_it->second.size() << std::endl;
   }
   
-  // Step 2: Get most critical path (first element after sorting)
+  // Get most critical path
   const auto& [critical_path_idx, slack_budget] = budget_it->second[0];
   
   if (verbose) {
@@ -2076,7 +2063,7 @@ AggloCluster::processFanOutPin(FlopUnit& flop,
     std::cout << "      Slack budget: " << slack_budget << std::endl;
   }
   
-  // Get the fan-out net
+  // Validate net connection
   odb::dbNet* fanout_net = out_pin->getNet();
   if (!fanout_net) {
     if (verbose) {
@@ -2090,19 +2077,18 @@ AggloCluster::processFanOutPin(FlopUnit& flop,
     std::cout << "    Fan-out net: " << fanout_net->getName() << std::endl;
   }
   
-  // Step 3: Extract cell delay coefficients
-  odb::dbMTerm* output_pin_master_term = out_pin->getMTerm();
-  auto cap_delay = extractCapacitanceDelayPoints(flop.inst_, 
-                                                  clk_pin_lib->getName(), 
-                                                  output_pin_master_term->getName(), 
-                                                  0);
+  // Extract cell delay characterization
+  const auto cap_delay = extractCapacitanceDelayPoints(
+      flop.inst_, 
+      clk_pin_lib->getName(), 
+      out_pin->getMTerm()->getName(), 
+      0);
   
-  // Calculate coefficients (dy/dx) for each segment
   std::vector<float> coeffs;
   coeffs.reserve(cap_delay.size() - 1);
   for (size_t i = 1; i < cap_delay.size(); ++i) {
-    float dy = cap_delay[i].second - cap_delay[i-1].second;
-    float dx = cap_delay[i].first - cap_delay[i-1].first;
+    const float dy = cap_delay[i].second - cap_delay[i-1].second;
+    const float dx = cap_delay[i].first - cap_delay[i-1].first;
     coeffs.push_back(dy / dx);
   }
   
@@ -2119,28 +2105,25 @@ AggloCluster::processFanOutPin(FlopUnit& flop,
     }
   }
   
-  // Step 4: Build Steiner tree and calculate net delay
-  sta::Pin* driver_pin_sta = network_->dbToSta(out_pin);
+  // Build Steiner tree and compute parasitics
+  const sta::Pin* driver_pin_sta = network_->dbToSta(out_pin);
   est::SteinerTree* driver_steiner_tree = est->makeSteinerTree(driver_pin_sta);
   
-  // Net capacitance computation
   const sta::Net* fanout_net_sta = network_->dbToSta(fanout_net);
-  auto pin_capacitance = 0.0f, wire_capacitance_total = 0.0f;
+  float pin_capacitance = 0.0f, wire_capacitance_total = 0.0f;
   const sta::MinMax* mm = sta::MinMax::max();
   sta_->connectedCap(fanout_net_sta, corner_, mm, pin_capacitance, wire_capacitance_total);
-  auto total_net_capacitance = pin_capacitance + wire_capacitance_total;
+  const float total_net_capacitance = pin_capacitance + wire_capacitance_total;
   
-  // Get distance from driver to first Steiner point
-  auto top_steiner_point = driver_steiner_tree->top();
-  auto driver_point = driver_steiner_tree->drvrPt();
-  auto steiner_location = driver_steiner_tree->location(top_steiner_point);
-  auto driver_location = driver_steiner_tree->location(driver_point);
-  double l1 = dbuToMeters(driver_steiner_tree->distance(driver_point, top_steiner_point));
+  const auto top_steiner_point = driver_steiner_tree->top();
+  const auto driver_point = driver_steiner_tree->drvrPt();
+  const auto steiner_location = driver_steiner_tree->location(top_steiner_point);
+  const auto driver_location = driver_steiner_tree->location(driver_point);
+  const double l1 = dbuToMeters(driver_steiner_tree->distance(driver_point, top_steiner_point));
   
-  // Wire resistance and capacitance up to first Steiner point
-  auto wire_cap = l1 * unit_c;
-  auto wire_res = l1 * unit_r;
-  auto capacitance_beyond_first_steiner = total_net_capacitance - wire_cap;
+  const float wire_cap = l1 * unit_c;
+  const float wire_res = l1 * unit_r;
+  const float capacitance_beyond_first_steiner = total_net_capacitance - wire_cap;
   
   if (verbose) {
     std::cout << "    Steiner tree analysis:" << std::endl;
@@ -2157,19 +2140,18 @@ AggloCluster::processFanOutPin(FlopUnit& flop,
     std::cout << "      Remaining capacitance: " << capacitance_beyond_first_steiner << std::endl;
   }
   
-  // Step 5: Solve for max distance by trying each coefficient segment
-  float max_dist = l1;
+  // Solve for maximum distance using coefficient segments
+  float max_dist = -1.0f;  // Invalid value if no valid segment found
   bool found_valid_segment = false;
   
   if (verbose) {
     std::cout << "    Solving for maximum distance:" << std::endl;
   }
   
-  // Try each coefficient segment
   for (size_t seg_idx = 0; seg_idx < coeffs.size(); ++seg_idx) {
-    float coeff = coeffs[seg_idx];
-    float segment_cap_min = cap_delay[seg_idx].first;
-    float segment_cap_max = cap_delay[seg_idx + 1].first;
+    const float coeff = coeffs[seg_idx];
+    const float segment_cap_min = cap_delay[seg_idx].first;
+    const float segment_cap_max = cap_delay[seg_idx + 1].first;
     
     if (verbose) {
       std::cout << "      Trying segment [" << seg_idx << "-" << (seg_idx+1) << "]:" << std::endl;
@@ -2177,20 +2159,23 @@ AggloCluster::processFanOutPin(FlopUnit& flop,
       std::cout << "        Cap range: [" << segment_cap_min << ", " << segment_cap_max << "]" << std::endl;
     }
     
-    // Solve quadratic for this segment
-    float candidate_dist = solveMaxDistanceFanOut(l1, unit_r, unit_c, slack_budget, 
-                                                   coeff, capacitance_beyond_first_steiner, verbose);
+    const float candidate_dist = solveMaxDistanceFanOut(
+        l1, unit_r, unit_c, slack_budget, coeff, capacitance_beyond_first_steiner, verbose);
     
-    // Calculate resulting total capacitance
-    float dist_in_meters = candidate_dist;
-    float resulting_cap = dist_in_meters * unit_c + capacitance_beyond_first_steiner;
+    if (candidate_dist < 0) {
+      if (verbose) {
+        std::cout << "        ✗ Invalid solution (negative or no real root)" << std::endl;
+      }
+      continue;
+    }
+    
+    const float resulting_cap = candidate_dist * unit_c + capacitance_beyond_first_steiner;
     
     if (verbose) {
-      std::cout << "        Candidate distance: " << candidate_dist << " DBU" << std::endl;
+      std::cout << "        Candidate distance: " << candidate_dist << std::endl;
       std::cout << "        Resulting capacitance: " << resulting_cap << std::endl;
     }
     
-    // Check if resulting capacitance is within this segment's range
     if (resulting_cap >= segment_cap_min && resulting_cap <= segment_cap_max) {
       max_dist = candidate_dist;
       found_valid_segment = true;
@@ -2206,16 +2191,17 @@ AggloCluster::processFanOutPin(FlopUnit& flop,
     }
   }
   
-  if (!found_valid_segment && verbose) {
-    std::cout << "      Warning: No valid segment found, using default distance" << std::endl;
+  if (!found_valid_segment) {
+    max_dist = l1;
+    if (verbose) {
+      std::cout << "      Warning: No valid segment found, using l1 as default distance: " << l1 << std::endl;
+    }
   }
   
-  // Step 6: Create feasible region box
-
   max_dist = metersToDbu(max_dist);
 
-  int steiner_x = steiner_location.getX();
-  int steiner_y = steiner_location.getY();
+  const int steiner_x = steiner_location.getX();
+  const int steiner_y = steiner_location.getY();
   
   if (verbose) {
     std::cout << "    Maximum placement distance:" << std::endl;
@@ -2228,18 +2214,18 @@ AggloCluster::processFanOutPin(FlopUnit& flop,
 
 void
 AggloCluster::processFanInPin(FlopUnit& flop,
-                             odb::dbITerm* d_pin,
-                             est::EstimateParasitics* est,
-                             double unit_r,
-                             double unit_c,
-                             bool verbose)
+                              odb::dbITerm* d_pin,
+                              est::EstimateParasitics* est,
+                              double unit_r,
+                              double unit_c,
+                              bool verbose)
 {
   if (verbose) {
     std::cout << "\n  [Step 4.1] Processing Fan-In Pin: " << d_pin->getMTerm()->getName() << std::endl;
   }
   
-  // Step 1: Check if pin has timing constraints
-  auto budget_it = flop.pin_budgets_.find(d_pin);
+  // Check timing constraints
+  const auto budget_it = flop.pin_budgets_.find(d_pin);
   if (budget_it == flop.pin_budgets_.end() || budget_it->second.empty()) {
     if (verbose) {
       std::cout << "    No timing constraints found" << std::endl;
@@ -2253,7 +2239,7 @@ AggloCluster::processFanInPin(FlopUnit& flop,
     std::cout << "    Total timing paths for this pin: " << budget_it->second.size() << std::endl;
   }
   
-  // Step 2: Get most critical path
+  // Get most critical path
   const auto& [critical_path_idx, slack_budget] = budget_it->second[0];
   
   if (verbose) {
@@ -2262,7 +2248,7 @@ AggloCluster::processFanInPin(FlopUnit& flop,
     std::cout << "      Slack budget: " << slack_budget << std::endl;
   }
   
-  // Get the fan-in net
+  // Validate net connection
   odb::dbNet* fi_net = d_pin->getNet();
   if (!fi_net) {
     if (verbose) {
@@ -2276,7 +2262,7 @@ AggloCluster::processFanInPin(FlopUnit& flop,
     std::cout << "    Fan-in net: " << fi_net->getName() << std::endl;
   }
   
-  // Get driver pin of fan-in net
+  // Get driver pin
   odb::dbITerm* fi_net_drvr_pin = fi_net->get1stITerm();
   if (!fi_net_drvr_pin) {
     if (verbose) {
@@ -2291,38 +2277,38 @@ AggloCluster::processFanInPin(FlopUnit& flop,
     std::cout << "    Driver pin: " << fi_net_drvr_pin->getMTerm()->getName() << std::endl;
   }
   
-  // Step 3: Calculate D pin capacitance
+  // Calculate D pin capacitance
   const sta::Pin* ipin_sta = network_->dbToSta(d_pin);
-  float ipin_cap = getPinCapacitance(ipin_sta);
+  const float ipin_cap = getPinCapacitance(ipin_sta);
   
   if (verbose) {
     std::cout << "    D pin input capacitance: " << ipin_cap << std::endl;
   }
   
-  // Step 4: Extract cell delay coefficient
+  // Extract cell delay characterization
   odb::dbInst* fi_inst = fi_net_drvr_pin->getInst();
-  std::vector<std::pair<odb::dbITerm*, float>> slews = getInstanceInputSlews(fi_inst);
+  const auto slews = getInstanceInputSlews(fi_inst);
   
   std::vector<std::pair<float, float>> cap_delay;
-  float worst_delay = 0.0;
+  float worst_delay = 0.0f;
   
   if (verbose) {
     std::cout << "    Driver cell delay analysis:" << std::endl;
     std::cout << "      Input pins with slews: " << slews.size() << std::endl;
   }
   
-  for (auto& [iterm, slew] : slews) {
-    auto pts = extractCapacitanceDelayPoints(
+  for (const auto& [iterm, slew] : slews) {
+    const auto pts = extractCapacitanceDelayPoints(
         fi_inst,
         iterm->getMTerm()->getName(),
         fi_net_drvr_pin->getMTerm()->getName(),
         slew);
     
     if (!pts.empty()) {
-      float tail_second = pts.back().second;
+      const float tail_second = pts.back().second;
       if (tail_second >= worst_delay) {
         worst_delay = tail_second;
-        cap_delay = std::move(pts);
+        cap_delay = pts;
       }
     }
   }
@@ -2335,12 +2321,12 @@ AggloCluster::processFanInPin(FlopUnit& flop,
     return;
   }
   
-  // Calculate coefficients (dy/dx) for each segment
+  // Calculate coefficients
   std::vector<float> coeffs;
   coeffs.reserve(cap_delay.size() - 1);
   for (size_t i = 1; i < cap_delay.size(); ++i) {
-    float dy = cap_delay[i].second - cap_delay[i-1].second;
-    float dx = cap_delay[i].first - cap_delay[i-1].first;
+    const float dy = cap_delay[i].second - cap_delay[i-1].second;
+    const float dx = cap_delay[i].first - cap_delay[i-1].first;
     coeffs.push_back(dy / dx);
   }
   
@@ -2356,18 +2342,25 @@ AggloCluster::processFanInPin(FlopUnit& flop,
     }
   }
   
-  // Step 5: Build Steiner tree for fan-in net
+  // Build Steiner tree
   const sta::Pin* fi_net_drvr_pin_sta = network_->dbToSta(fi_net_drvr_pin);
   est::SteinerTree* fi_tree = est->makeSteinerTree(fi_net_drvr_pin_sta);
   
-  auto pin_cap = 0.0f, wire_cap = 0.0f;
+  float pin_cap = 0.0f, wire_cap = 0.0f;
   const sta::MinMax* mm = sta::MinMax::max();
-  const sta::Net* fi_net_drvr_sta =network_->dbToSta(fi_net_drvr_pin->getNet());
+  const sta::Net* fi_net_drvr_sta = network_->dbToSta(fi_net_drvr_pin->getNet());
   sta_->connectedCap(fi_net_drvr_sta, corner_, mm, pin_cap, wire_cap);
-  auto total_cap = pin_cap + wire_cap;
+  const float total_cap = pin_cap + wire_cap;
 
-  auto top_pt = fi_tree->top();
-  auto top_loc = fi_tree->location(top_pt);
+  if (verbose) {
+    std::cout << "    Net capacitance:" << std::endl;
+    std::cout << "      Pin capacitance: " << pin_cap << std::endl;
+    std::cout << "      Wire capacitance: " << wire_cap << std::endl;
+    std::cout << "      Total capacitance: " << total_cap << std::endl;
+  }
+
+  const auto top_pt = fi_tree->top();
+  const auto top_loc = fi_tree->location(top_pt);
   const int top_x = top_loc.getX();
   const int top_y = top_loc.getY();
   
@@ -2378,9 +2371,9 @@ AggloCluster::processFanInPin(FlopUnit& flop,
     std::cout << "      Pin count: " << fi_tree->pinCount() << std::endl;
   }
   
-  // Step 6: Find path from driver to target D pin in Steiner tree
-  int branch_count = fi_tree->branchCount();
-  int pin_count = fi_tree->pinCount();
+  // Find path in Steiner tree
+  const int branch_count = fi_tree->branchCount();
+  const int pin_count = fi_tree->pinCount();
   
   int target_pt = -1;
   for (int i = 0; i < pin_count; i++) {
@@ -2398,7 +2391,7 @@ AggloCluster::processFanInPin(FlopUnit& flop,
     return;
   }
   
-  int drvr_pt = fi_tree->drvrPt();
+  const int drvr_pt = fi_tree->drvrPt();
   std::vector<int> node_path;
   
   if (!findSteinerPathRecursive(fi_tree, drvr_pt, target_pt, node_path)) {
@@ -2424,19 +2417,16 @@ AggloCluster::processFanInPin(FlopUnit& flop,
     std::cout << "      Path nodes: " << node_path.size() << std::endl;
   }
   
-  // Calculate pre-leaf and final segment lengths
+  // Calculate path segments
   const size_t total_segments = node_path.size() - 1;
-  std::vector<int> pre_leaf_branch_indices;
-  int final_branch_index = -1;
-  float pre_leaf_length_dbu = 0.0;
-  float final_segment_length_dbu = 0.0;
+  float pre_leaf_length_dbu = 0.0f;
+  float final_segment_length_dbu = 0.0f;
   
   for (size_t k = 0; k < total_segments; ++k) {
-    int path_node1 = node_path[k];
-    int path_node2 = node_path[k + 1];
+    const int path_node1 = node_path[k];
+    const int path_node2 = node_path[k + 1];
     
     int current_wire_length = 0;
-    int current_branch_index = -1;
     
     for (int i = 0; i < branch_count; i++) {
       odb::Point pt1, pt2;
@@ -2445,7 +2435,6 @@ AggloCluster::processFanInPin(FlopUnit& flop,
       
       if ((steiner_pt1 == path_node1 && steiner_pt2 == path_node2) ||
           (steiner_pt1 == path_node2 && steiner_pt2 == path_node1)) {
-        current_branch_index = i;
         current_wire_length = wire_length;
         break;
       }
@@ -2453,38 +2442,35 @@ AggloCluster::processFanInPin(FlopUnit& flop,
     
     if (k < total_segments - 1) {
       pre_leaf_length_dbu += current_wire_length;
-      pre_leaf_branch_indices.push_back(current_branch_index);
     } else {
       final_segment_length_dbu = current_wire_length;
-      final_branch_index = current_branch_index;
     }
   }
   
-  // Step 7: Solve for max distance by trying each coefficient segment
-  float l1 = dbuToMeters(final_segment_length_dbu);
-  float on_path_R_wo_last = unit_r * dbuToMeters(pre_leaf_length_dbu);
+  // Solve for maximum distance using coefficient segments
+  const float l1 = dbuToMeters(final_segment_length_dbu);
+  const float on_path_R_wo_last = unit_r * dbuToMeters(pre_leaf_length_dbu);
   
   if (verbose) {
     std::cout << "    Wire path segmentation:" << std::endl;
     std::cout << "      Total segments: " << total_segments << std::endl;
     std::cout << "      Pre-leaf segments: " << (total_segments - 1) << std::endl;
-    std::cout << "      Pre-leaf length: " << pre_leaf_length_dbu << " DBU" << std::endl;
-    std::cout << "      Final segment length: " << final_segment_length_dbu << " DBU" << std::endl;
+    std::cout << "      Pre-leaf length: " << dbuToMeters(pre_leaf_length_dbu) << std::endl;
+    std::cout << "      Final segment length: " << l1 << std::endl;
     std::cout << "      Pre-leaf resistance: " << on_path_R_wo_last << std::endl;
   }
   
-  float max_dist = l1;
+  float max_dist = -1.0f;  // Invalid value if no valid segment found
   bool found_valid_segment = false;
   
   if (verbose) {
     std::cout << "    Solving for maximum distance:" << std::endl;
   }
   
-  // Try each coefficient segment
   for (size_t seg_idx = 0; seg_idx < coeffs.size(); ++seg_idx) {
-    float coeff = coeffs[seg_idx];
-    float segment_cap_min = cap_delay[seg_idx].first;
-    float segment_cap_max = cap_delay[seg_idx + 1].first;
+    const float coeff = coeffs[seg_idx];
+    const float segment_cap_min = cap_delay[seg_idx].first;
+    const float segment_cap_max = cap_delay[seg_idx + 1].first;
     
     if (verbose) {
       std::cout << "      Trying segment [" << seg_idx << "-" << (seg_idx+1) 
@@ -2492,21 +2478,24 @@ AggloCluster::processFanInPin(FlopUnit& flop,
                 << ", cap_range=[" << segment_cap_min << ", " << segment_cap_max << "]" << std::endl;
     }
     
-    // Solve quadratic for this segment
-    float candidate_dist = solveMaxDistanceFanIn(l1, unit_r, unit_c, slack_budget, 
-                                                  coeff, on_path_R_wo_last, ipin_cap, verbose);
+    const float candidate_dist = solveMaxDistanceFanIn(
+        l1, unit_r, unit_c, slack_budget, coeff, on_path_R_wo_last, ipin_cap, verbose);
     
-    // Calculate resulting total capacitance
-    float dist_in_meters = candidate_dist;
-    float resulting_cap = total_cap + (dist_in_meters-l1) * unit_c;
-    
-    if (verbose) {
-      std::cout << "      Candidate distance: " << candidate_dist << " m, resulting_cap: " << resulting_cap << std::endl;
+    if (candidate_dist < 0) {
+      if (verbose) {
+        std::cout << "        ✗ Invalid solution (negative or no real root)" << std::endl;
+      }
+      continue;
     }
     
-    // Check if resulting capacitance is within this segment's range
+    const float resulting_cap = total_cap + (candidate_dist - l1) * unit_c;
+    
+    if (verbose) {
+      std::cout << "      Candidate distance: " << candidate_dist << ", resulting_cap: " << resulting_cap << std::endl;
+    }
+    
     if (resulting_cap >= segment_cap_min && resulting_cap <= segment_cap_max) {
-      max_dist = candidate_dist;  // Convert meters to DBU
+      max_dist = candidate_dist;
       found_valid_segment = true;
       if (verbose) {
         std::cout << "      ✓ Valid segment found! Using max_dist = " << max_dist << std::endl;
@@ -2519,11 +2508,13 @@ AggloCluster::processFanInPin(FlopUnit& flop,
     }
   }
   
-  if (!found_valid_segment && verbose) {
-    std::cout << "      Warning: No valid segment found, using default distance" << std::endl;
+  if (!found_valid_segment) {
+    max_dist = l1;
+    if (verbose) {
+      std::cout << "      Warning: No valid segment found, using l1 as default distance: " << l1 << std::endl;
+    }
   }
   
-  // Step 8: Create feasible region box
   max_dist = metersToDbu(max_dist);
 
   if (verbose) {
@@ -2537,28 +2528,27 @@ AggloCluster::processFanInPin(FlopUnit& flop,
 
 void
 AggloCluster::computeFinalFeasibleRegion(FlopUnit& flop,
-                                        const std::vector<odb::dbITerm*>& all_pins,
-                                        bool verbose)
+                                         const std::vector<odb::dbITerm*>& all_pins,
+                                         bool verbose)
 {
   if (verbose) {
     std::cout << "\n  [Step 5] Computing Final Feasible Region" << std::endl;
     std::cout << "    Total pins to process: " << all_pins.size() << std::endl;
   }
   
-  // Start with inverse box (empty intersection)
   Box final_region = boost::geometry::make_inverse<Box>();
   bool has_valid_region = false;
   
   // Intersect all pin feasible regions
   for (odb::dbITerm* pin : all_pins) {
-    auto it = flop.pin_feasible_regions_.find(pin);
+    const auto it = flop.pin_feasible_regions_.find(pin);
     if (it == flop.pin_feasible_regions_.end()) {
-      continue;  // Pin not found
+      continue;
     }
     
     const Box& pin_box = it->second;
     
-    // Skip inverse boxes (no constraints) - they don't affect the intersection
+    // Skip inverse boxes (no constraints)
     if (pin_box.min_corner().get<0>() > pin_box.max_corner().get<0>() ||
         pin_box.min_corner().get<1>() > pin_box.max_corner().get<1>()) {
       if (verbose) {
@@ -2568,7 +2558,6 @@ AggloCluster::computeFinalFeasibleRegion(FlopUnit& flop,
       continue;
     }
     
-    // Valid box - compute intersection with final region
     if (verbose) {
       std::cout << "    Pin " << pin->getMTerm()->getName() 
                 << " has valid region: [(" 
@@ -2579,21 +2568,17 @@ AggloCluster::computeFinalFeasibleRegion(FlopUnit& flop,
     }
     
     if (!has_valid_region) {
-      // First valid box - initialize final_region
       final_region = pin_box;
       has_valid_region = true;
     } else {
-      // Compute intersection (all constraints must be satisfied)
       Box intersection;
       boost::geometry::intersection(final_region, pin_box, intersection);
       
-      // Check if intersection is empty
       if (boost::geometry::is_empty(intersection)) {
         if (verbose) {
           std::cout << "      WARNING: No intersection - constraints conflict!" << std::endl;
           std::cout << "      Setting feasible region to empty box (no valid placement)" << std::endl;
         }
-        // No valid placement exists - set to empty box (default constructed)
         flop.feasible_region_ = Box();
         return;
       }
@@ -2616,19 +2601,17 @@ AggloCluster::computeFinalFeasibleRegion(FlopUnit& flop,
     }
     
     const odb::Rect& core_area = block_->getCoreArea();
-    Point core_min_orig(core_area.xMin(), core_area.yMin());
-    Point core_max_orig(core_area.xMax(), core_area.yMax());
-    Point core_min_tf = transformCoords(core_min_orig);
-    Point core_max_tf = transformCoords(core_max_orig);
+    const Point core_min_orig(core_area.xMin(), core_area.yMin());
+    const Point core_max_orig(core_area.xMax(), core_area.yMax());
+    const Point core_min_tf = transformCoords(core_min_orig);
+    const Point core_max_tf = transformCoords(core_max_orig);
     
-    int min_x = std::min(core_min_tf.get<0>(), core_max_tf.get<0>());
-    int max_x = std::max(core_min_tf.get<0>(), core_max_tf.get<0>());
-    int min_y = std::min(core_min_tf.get<1>(), core_max_tf.get<1>());
-    int max_y = std::max(core_min_tf.get<1>(), core_max_tf.get<1>());
+    const int min_x = std::min(core_min_tf.get<0>(), core_max_tf.get<0>());
+    const int max_x = std::max(core_min_tf.get<0>(), core_max_tf.get<0>());
+    const int min_y = std::min(core_min_tf.get<1>(), core_max_tf.get<1>());
+    const int max_y = std::max(core_min_tf.get<1>(), core_max_tf.get<1>());
     
-    Point box_min(min_x, min_y);
-    Point box_max(max_x, max_y);
-    final_region = Box(box_min, box_max);
+    final_region = Box(Point(min_x, min_y), Point(max_x, max_y));
     
     if (verbose) {
       std::cout << "    Core area transformed: [(" << min_x << ", " << min_y 
@@ -2794,7 +2777,6 @@ AggloCluster::solveMaxDistanceFanOut(float l1,
            - coeff * l1 * unit_c;
   
   float D = std::pow(b, 2) - 4 * a * c;
-  float max_dist = l1;  // Default to original distance (in meters)
   
   if (verbose) {
     std::cout << "    Solving quadratic equation for maximum distance (FanOut):" << std::endl;
@@ -2805,32 +2787,33 @@ AggloCluster::solveMaxDistanceFanOut(float l1,
   if (D < 0) {
     if (verbose) {
       std::cout << "      No real roots - discriminant is negative" << std::endl;
-      std::cout << "      Using original distance (l1): " << l1 << std::endl;
+      std::cout << "      Returning invalid value (-1.0)" << std::endl;
     }
-  } else {
-    // Calculate roots using quadratic formula (result in meters)
-    float root1 = (-b + sqrt(D)) / (2 * a);
-    float root2 = (-b - sqrt(D)) / (2 * a);
-    
-    if (verbose) {
-      std::cout << "      Root 1: " << root1 << std::endl;
-      std::cout << "      Root 2: " << root2 << std::endl;
-    }
-    
-    // Use larger positive root, or original distance if both negative
-    if (root1 > 0 || root2 > 0) {
-      max_dist = std::max(root1, root2);
-      if (verbose) {
-        std::cout << "      Selected maximum distance: " << max_dist << std::endl;
-      }
-    } else {
-      if (verbose) {
-        std::cout << "      Both roots are negative - using original distance" << std::endl;
-      }
-    }
+    return -1.0f;
   }
   
-  return max_dist;  // Return in meters
+  // Calculate roots using quadratic formula (result in meters)
+  float root1 = (-b + sqrt(D)) / (2 * a);
+  float root2 = (-b - sqrt(D)) / (2 * a);
+  
+  if (verbose) {
+    std::cout << "      Root 1: " << root1 << std::endl;
+    std::cout << "      Root 2: " << root2 << std::endl;
+  }
+  
+  // Use larger positive root
+  if (root1 > 0 || root2 > 0) {
+    float max_dist = std::max(root1, root2);
+    if (verbose) {
+      std::cout << "      Selected maximum distance: " << max_dist << std::endl;
+    }
+    return max_dist;
+  }
+  
+  if (verbose) {
+    std::cout << "      Both roots are negative - returning invalid value (-1.0)" << std::endl;
+  }
+  return -1.0f;
 }
 
 float
@@ -2846,7 +2829,6 @@ AggloCluster::solveMaxDistanceFanIn(float l1,
   // Solve quadratic equation for Fan-In case
   // where x is the new Manhattan distance from Steiner point to flop (in meters)
   auto a = unit_r * unit_c;
-  // auto b = on_path_R_wo_last * unit_c + coeff * unit_c + on_path_R_wo_last * ipin_cap;
   auto b = on_path_R_wo_last * unit_c + coeff * unit_c + unit_r * ipin_cap;
   auto c = -pow(l1, 2) * unit_r * unit_c 
            - on_path_R_wo_last * unit_c * l1 
@@ -2855,7 +2837,6 @@ AggloCluster::solveMaxDistanceFanIn(float l1,
            - slack_budget;
   
   float D = pow(b, 2) - 4 * a * c;
-  float max_dist = l1;  // Default to original distance (in meters)
   
   if (verbose) {
     std::cout << "    Solving quadratic equation for maximum distance (FanIn):" << std::endl;
@@ -2866,32 +2847,33 @@ AggloCluster::solveMaxDistanceFanIn(float l1,
   if (D < 0) {
     if (verbose) {
       std::cout << "      No real roots - discriminant is negative" << std::endl;
-      std::cout << "      Using original distance (l1): " << l1 << std::endl;
+      std::cout << "      Returning invalid value (-1.0)" << std::endl;
     }
-  } else {
-    // Calculate roots using quadratic formula (result in meters)
-    float root1 = (-b + sqrt(D)) / (2 * a);
-    float root2 = (-b - sqrt(D)) / (2 * a);
-    
-    if (verbose) {
-      std::cout << "      Root 1: " << root1 << std::endl;
-      std::cout << "      Root 2: " << root2 << std::endl;
-    }
-    
-    // Use larger positive root, or original distance if both negative
-    if (root1 > 0 || root2 > 0) {
-      max_dist = std::max(root1, root2);
-      if (verbose) {
-        std::cout << "      Selected maximum distance: " << max_dist << std::endl;
-      }
-    } else {
-      if (verbose) {
-        std::cout << "      Both roots are negative - using original distance" << std::endl;
-      }
-    }
+    return -1.0f;
   }
   
-  return max_dist;  // Return in meters
+  // Calculate roots using quadratic formula (result in meters)
+  float root1 = (-b + sqrt(D)) / (2 * a);
+  float root2 = (-b - sqrt(D)) / (2 * a);
+  
+  if (verbose) {
+    std::cout << "      Root 1: " << root1 << std::endl;
+    std::cout << "      Root 2: " << root2 << std::endl;
+  }
+  
+  // Use larger positive root
+  if (root1 > 0 || root2 > 0) {
+    float max_dist = std::max(root1, root2);
+    if (verbose) {
+      std::cout << "      Selected maximum distance: " << max_dist << std::endl;
+    }
+    return max_dist;
+  }
+  
+  if (verbose) {
+    std::cout << "      Both roots are negative - returning invalid value (-1.0)" << std::endl;
+  }
+  return -1.0f;
 }
 
 Box
