@@ -218,6 +218,7 @@ AggloCluster::AggloCluster(odb::dbDatabase* db,
                            float target_overflow,
                            int num_paths_per_endpoint,
                            int threads,
+                           float feasible_region_bin_multiplier,
                            bool verbose)
     : db_(db),
       block_(db->getChip()->getBlock()),
@@ -230,6 +231,7 @@ AggloCluster::AggloCluster(odb::dbDatabase* db,
       target_overflow_(target_overflow),
       num_paths_per_endpoint_(num_paths_per_endpoint),
       threads_(threads),
+      feasible_region_bin_multiplier_(feasible_region_bin_multiplier),
       verbose_(verbose)
 {
 }
@@ -256,14 +258,14 @@ void AggloCluster::doAggloCluster()
   analyzeTimingPaths();
 
   calcFeasibleRegions();
-  
-  exit(0);
 
   createFlopClusters();
 
   createCompatibilityGraph();
 
   runAgglomerativeClustering();
+
+  exit(0); // Temporary exit for debugging
 
   implementClusters();
 }
@@ -1153,7 +1155,7 @@ AggloCluster::calcFeasibleRegions()
   }
 
   int flop_count = 0;
-  constexpr int DEBUG_SAMPLE_SIZE = 100;
+  constexpr int DEBUG_SAMPLE_SIZE = 530;
 
   for (FlopUnit& flop : flop_units_) {
     bool enable_verbose = verbose_ && (flop_count < DEBUG_SAMPLE_SIZE);
@@ -1187,18 +1189,144 @@ AggloCluster::calcFeasibleRegions()
 void 
 AggloCluster::createFlopClusters()
 {
+  if (verbose_) {
+    std::cout << "\n[createFlopClusters] Starting flop cluster initialization..." << std::endl;
+  }
+
   flop_clusters_.clear();
   flop_clusters_.reserve(flop_units_.size());
   feasible_regions_.clear();
   flop_cluster_is_valid_.assign(flop_units_.size(), true);
   flop_cluster_no_further_merge_.assign(flop_units_.size(), false);
 
+  if (verbose_) {
+    std::cout << "[Step 1] Data Structure Initialization" << std::endl;
+    std::cout << "  - Reserved capacity: " << flop_units_.size() << " clusters" << std::endl;
+  }
+
+  //----------------------------------------------------------------------------
+  // Step 2: Create initial single-flop clusters
+  //----------------------------------------------------------------------------
   for (size_t i = 0; i < flop_units_.size(); ++i) {
     flop_clusters_.emplace_back(i, flop_units_[i]);
     flop_units_[i].cluster_idx_ = i;
 
     const Box& feasible_region = flop_units_[i].feasible_region_;
     feasible_regions_.insert(std::make_pair(feasible_region, i));
+  }
+
+  if (verbose_) {
+    std::cout << "[Step 2] Initial Cluster Creation Completed" << std::endl;
+    std::cout << "  - Total flop clusters created: " << flop_clusters_.size() << std::endl;
+    std::cout << "  - Feasible regions registered: " << feasible_regions_.size() << std::endl;
+
+    //--------------------------------------------------------------------------
+    // Step 3: Sample cluster details with overlap analysis
+    //--------------------------------------------------------------------------
+    constexpr int DEBUG_SAMPLE_SIZE = 5;
+    if (!flop_clusters_.empty()) {
+      std::cout << "\n[Sample Flop Clusters with Overlap Analysis]" << std::endl;
+      for (size_t i = 0; i < std::min(DEBUG_SAMPLE_SIZE, static_cast<int>(flop_clusters_.size())); ++i) {
+        const FlopCluster& cluster = flop_clusters_[i];
+        const FlopUnit& flop = flop_units_[i];
+        
+        std::cout << "  Cluster #" << i << ":" << std::endl;
+        std::cout << "    Flop instance: " << flop.inst_->getName() << std::endl;
+        std::cout << "    Master: " << flop.inst_->getMaster()->getName() << std::endl;
+        std::cout << "    Original location: (" << flop.orig_pt_.x << ", " << flop.orig_pt_.y << ")" << std::endl;
+        
+        // Feasible region details (45-degree rotated coordinate system)
+        const Box& fr = flop.feasible_region_;
+        std::cout << "    Feasible region (45° rotated): (" 
+                  << fr.min_corner().get<0>() << ", " << fr.min_corner().get<1>() << ") -> ("
+                  << fr.max_corner().get<0>() << ", " << fr.max_corner().get<1>() << ")" << std::endl;
+        
+        int fr_width = fr.max_corner().get<0>() - fr.min_corner().get<0>();
+        int fr_height = fr.max_corner().get<1>() - fr.min_corner().get<1>();
+        std::cout << "    FR dimensions: " << fr_width << " x " << fr_height << " (rotated coords)" << std::endl;
+        
+        // Count overlapping clusters using RTree query
+        const std::vector<FlopClusterEntry> intersecting_clusters = getIntersectedCluster(cluster);
+        
+        int overlap_count = 0;
+        std::vector<int> overlapping_cluster_ids;
+        
+        for (const auto& [other_box, other_idx] : intersecting_clusters) {
+          if (static_cast<int>(other_idx) == static_cast<int>(i)) {
+            continue;  // Skip self
+          }
+          
+          overlap_count++;
+          if (overlapping_cluster_ids.size() < 3) {  // Store first 3 for display
+            overlapping_cluster_ids.push_back(other_idx);
+          }
+        }
+        
+        std::cout << "    Overlapping clusters: " << overlap_count << std::endl;
+        if (!overlapping_cluster_ids.empty()) {
+          std::cout << "      Examples: ";
+          for (size_t j = 0; j < overlapping_cluster_ids.size(); ++j) {
+            std::cout << "Cluster#" << overlapping_cluster_ids[j];
+            if (j < overlapping_cluster_ids.size() - 1) {
+              std::cout << ", ";
+            }
+          }
+          if (overlap_count > 3) {
+            std::cout << " ... (+" << (overlap_count - 3) << " more)";
+          }
+          std::cout << std::endl;
+        }
+        
+        // Cluster state
+        std::cout << "    Is valid: " << (flop_cluster_is_valid_[i] ? "Yes" : "No") << std::endl;
+        std::cout << "    Further mergeable: " << (flop_cluster_no_further_merge_[i] ? "No" : "Yes") << std::endl;
+      }
+      
+      if (flop_clusters_.size() > DEBUG_SAMPLE_SIZE) {
+        std::cout << "  ... and " << (flop_clusters_.size() - DEBUG_SAMPLE_SIZE) 
+                  << " more clusters" << std::endl;
+      }
+    }
+
+    //--------------------------------------------------------------------------
+    // Step 4: Feasible region overlap statistics
+    //--------------------------------------------------------------------------
+    if (!feasible_regions_.empty()) {
+      std::cout << "\n[Feasible Region Overlap Statistics]" << std::endl;
+      std::cout << "  - Total entries in feasible_regions_: " << feasible_regions_.size() << std::endl;
+      
+      // Calculate overlap distribution using RTree queries
+      std::vector<int> overlap_counts;
+      overlap_counts.reserve(feasible_regions_.size());
+      
+      for (size_t idx = 0; idx < flop_clusters_.size(); ++idx) {
+        const std::vector<FlopClusterEntry> intersecting_clusters = getIntersectedCluster(flop_clusters_[idx]);
+        
+        int count = 0;
+        for (const auto& [other_box, other_idx] : intersecting_clusters) {
+          if (static_cast<size_t>(other_idx) != idx) {
+            count++;
+          }
+        }
+        overlap_counts.push_back(count);
+      }
+      
+      if (!overlap_counts.empty()) {
+        std::sort(overlap_counts.begin(), overlap_counts.end());
+        
+        int min_overlap = overlap_counts.front();
+        int max_overlap = overlap_counts.back();
+        int median_overlap = overlap_counts[overlap_counts.size() / 2];
+        double avg_overlap = std::accumulate(overlap_counts.begin(), overlap_counts.end(), 0.0) / overlap_counts.size();
+        
+        std::cout << "  - Min overlaps per FR: " << min_overlap << std::endl;
+        std::cout << "  - Max overlaps per FR: " << max_overlap << std::endl;
+        std::cout << "  - Median overlaps per FR: " << median_overlap << std::endl;
+        std::cout << "  - Average overlaps per FR: " << std::fixed << std::setprecision(1) << avg_overlap << std::endl;
+      }
+    }
+
+    std::cout << "[createFlopClusters] Completed successfully.\n" << std::endl;
   }
 }
 
@@ -1209,11 +1337,94 @@ AggloCluster::createFlopClusters()
 void
 AggloCluster::createCompatibilityGraph()
 {
+  if (verbose_) {
+    std::cout << "\n[createCompatibilityGraph] Starting compatibility graph construction..." << std::endl;
+  }
+
   edge_pq_.clear();
   adj_list_.clear();
 
+  if (verbose_) {
+    std::cout << "[Step 1] Data Structure Initialization" << std::endl;
+    std::cout << "  - Edge priority queue cleared" << std::endl;
+    std::cout << "  - Adjacency list cleared" << std::endl;
+  }
+
+  //----------------------------------------------------------------------------
+  // Step 2: Build edges for all clusters
+  //----------------------------------------------------------------------------
+  constexpr int DEBUG_SAMPLE_SIZE = 5;
+  
   for (size_t i = 0; i < flop_clusters_.size(); ++i) {
-    updateEdges(flop_clusters_[i]);
+    bool enable_verbose = verbose_ && (i < DEBUG_SAMPLE_SIZE);
+    updateEdges(flop_clusters_[i], enable_verbose);
+  }
+
+  if (verbose_) {
+    std::cout << "\n[Step 2] Edge Construction Completed" << std::endl;
+    std::cout << "  - Total clusters processed: " << flop_clusters_.size() << std::endl;
+    std::cout << "  - Total edges created: " << edge_pq_.size() << std::endl;
+    std::cout << "  - Adjacency list entries: " << adj_list_.size() << std::endl;
+    
+    if (flop_clusters_.size() > DEBUG_SAMPLE_SIZE) {
+      std::cout << "  - Detailed output shown for first " << DEBUG_SAMPLE_SIZE << " clusters" << std::endl;
+    }
+
+    //--------------------------------------------------------------------------
+    // Step 3: Edge statistics
+    //--------------------------------------------------------------------------
+    if (!edge_pq_.empty()) {
+      std::vector<double> edge_weights;
+      edge_weights.reserve(edge_pq_.size());
+      for (const auto& edge : edge_pq_) {
+        edge_weights.push_back(edge.weight);
+      }
+      std::sort(edge_weights.begin(), edge_weights.end());
+
+      double min_weight = edge_weights.front();
+      double max_weight = edge_weights.back();
+      double median_weight = edge_weights[edge_weights.size() / 2];
+      double avg_weight = std::accumulate(edge_weights.begin(), edge_weights.end(), 0.0) / edge_weights.size();
+
+      int negative_weight_count = std::count_if(edge_weights.begin(), edge_weights.end(),
+                                                 [](double w) { return w < 0; });
+
+      std::cout << "\n[Step 3] Edge Weight Distribution" << std::endl;
+      std::cout << "  - Min weight (best improvement): " << std::fixed << std::setprecision(2) << min_weight << std::endl;
+      std::cout << "  - Max weight: " << max_weight << std::endl;
+      std::cout << "  - Median weight: " << median_weight << std::endl;
+      std::cout << "  - Average weight: " << avg_weight << std::endl;
+      std::cout << "  - Edges with HPWL improvement (negative): " << negative_weight_count
+                << " (" << std::fixed << std::setprecision(1) << (100.0 * negative_weight_count / edge_weights.size()) << "%)" << std::endl;
+
+      // Show top edges (best improvements)
+      std::cout << "\n[Sample Top Edges (best HPWL improvement)]" << std::endl;
+      constexpr int EDGE_SAMPLE_SIZE = 3;
+      int edge_count = 0;
+      for (const auto& edge : edge_pq_) {
+        if (edge_count >= EDGE_SAMPLE_SIZE) {
+          break;
+        }
+        
+        const FlopCluster& c1 = flop_clusters_[edge.n1];
+        const FlopCluster& c2 = flop_clusters_[edge.n2];
+        
+        std::cout << "  Edge #" << edge_count << ": Cluster[" << edge.n1 << "] <-> Cluster[" << edge.n2 << "]" << std::endl;
+        std::cout << "    Weight (HPWL gain): " << std::fixed << std::setprecision(2) << edge.weight << std::endl;
+        std::cout << "    Cluster[" << edge.n1 << "] size: " << c1.flops_.size() << " flop(s)" << std::endl;
+        std::cout << "    Cluster[" << edge.n2 << "] size: " << c2.flops_.size() << " flop(s)" << std::endl;
+        std::cout << "    Merged size would be: " << (c1.flops_.size() + c2.flops_.size()) << " flop(s)" << std::endl;
+        std::cout << "    Merge position: (" << edge.pos.x << ", " << edge.pos.y << ")" << std::endl;
+        
+        edge_count++;
+      }
+      
+      if (edge_pq_.size() > EDGE_SAMPLE_SIZE) {
+        std::cout << "  ... and " << (edge_pq_.size() - EDGE_SAMPLE_SIZE) << " more edges" << std::endl;
+      }
+    }
+
+    std::cout << "[createCompatibilityGraph] Completed successfully.\n" << std::endl;
   }
 }
 
@@ -1224,54 +1435,350 @@ AggloCluster::createCompatibilityGraph()
 void 
 AggloCluster::runAgglomerativeClustering()
 {
+  if (verbose_) {
+    std::cout << "\n[runAgglomerativeClustering] Starting agglomerative clustering..." << std::endl;
+    std::cout << "  - Initial edge queue size: " << edge_pq_.size() << std::endl;
+    std::cout << "  - Initial cluster count: " << flop_clusters_.size() << std::endl;
+  }
+
+  int iteration = 0;
+  int total_merges = 0;
+  int intermediate_merges = 0;
+  int final_merges = 0;
+  int skipped_invalid = 0;
+
+  // Track cluster size distribution for debugging
+  std::map<int, int> merge_size_dist;  // size -> count
+
+  constexpr int DEBUG_SAMPLE_SIZE = std::numeric_limits<int>::max();  // Show all samples
+
   while (!edge_pq_.empty()) {
-    Edge best_edge = *edge_pq_.rbegin();
-    edge_pq_.erase(std::prev(edge_pq_.end()));
+    // Get edge with minimum cost (most negative = best HPWL improvement)
+    Edge best_edge = *edge_pq_.begin();
+    edge_pq_.erase(edge_pq_.begin());
 
-    int n1_idx = best_edge.n1;
-    int n2_idx = best_edge.n2;
+    const int n1_idx = best_edge.n1;
+    const int n2_idx = best_edge.n2;
 
+    // Skip if either cluster is already merged
     if (!flop_cluster_is_valid_[n1_idx] || !flop_cluster_is_valid_[n2_idx]) {
+      skipped_invalid++;
       continue;
     }
 
-    // mergeClusters create new cluster and mark n1 and n2 as invalid
-    int n_new_idx = mergeClusters(best_edge);
-    const FlopCluster& n_new = flop_clusters_[n_new_idx];
+    const FlopCluster& c1 = flop_clusters_[n1_idx];
+    const FlopCluster& c2 = flop_clusters_[n2_idx];
 
-    if (isFurtherMergeable(n_new)) {
-      // Slack distribution is not performed, so just update edges
-      updateEdges(n_new); 
+    // Determine if we should show debug output for this merge
+    const bool show_debug = verbose_ && (total_merges < DEBUG_SAMPLE_SIZE);
+
+    if (show_debug) {
+      std::cout << "\n╔═══════════════════════════════════════════════════════════════╗" << std::endl;
+      std::cout << "║  MERGE #" << total_merges << " (Iteration " << iteration << ")" << std::endl;
+      std::cout << "╚═══════════════════════════════════════════════════════════════╝" << std::endl;
+      std::cout << "  Edge: Cluster[" << n1_idx << "] + Cluster[" << n2_idx << "]" << std::endl;
+      std::cout << "    • C1: size=" << c1.flops_.size() << ", pos=(" 
+                << c1.curr_pt_.x << ", " << c1.curr_pt_.y << ")" << std::endl;
+      std::cout << "    • C2: size=" << c2.flops_.size() << ", pos=(" 
+                << c2.curr_pt_.x << ", " << c2.curr_pt_.y << ")" << std::endl;
+      std::cout << "    • Edge weight (HPWL): " << std::fixed << std::setprecision(2) 
+                << best_edge.weight << (best_edge.weight < 0 ? " (improvement)" : " (degradation)") << std::endl;
+      std::cout << "    • New position: (" << best_edge.pos.x << ", " << best_edge.pos.y << ")" << std::endl;
+      
+      // Show feasible region info
+      const Box& fr1 = c1.feasible_region_;
+      const Box& fr2 = c2.feasible_region_;
+      std::cout << "    • C1 feasible region: ";
+      if (boost::geometry::is_empty(fr1)) {
+        std::cout << "EMPTY";
+      } else {
+        std::cout << "[(" << fr1.min_corner().get<0>() << "," << fr1.min_corner().get<1>() 
+                  << ") -> (" << fr1.max_corner().get<0>() << "," << fr1.max_corner().get<1>() << ")]";
+      }
+      std::cout << std::endl;
+      
+      std::cout << "    • C2 feasible region: ";
+      if (boost::geometry::is_empty(fr2)) {
+        std::cout << "EMPTY";
+      } else {
+        std::cout << "[(" << fr2.min_corner().get<0>() << "," << fr2.min_corner().get<1>() 
+                  << ") -> (" << fr2.max_corner().get<0>() << "," << fr2.max_corner().get<1>() << ")]";
+      }
+      std::cout << std::endl;
+    }
+
+    // Create new merged cluster
+    const int new_cluster_idx = mergeClusters(best_edge, show_debug);
+    const FlopCluster& new_cluster = flop_clusters_[new_cluster_idx];
+
+    if (show_debug) {
+      std::cout << "  ▸ New Cluster[" << new_cluster_idx << "]: size=" << new_cluster.flops_.size() << std::endl;
+      const Box& new_fr = new_cluster.feasible_region_;
+      std::cout << "    • Feasible region: ";
+      if (boost::geometry::is_empty(new_fr)) {
+        std::cout << "EMPTY (WARNING!)" << std::endl;
+      } else {
+        std::cout << "[(" << new_fr.min_corner().get<0>() << "," << new_fr.min_corner().get<1>() 
+                  << ") -> (" << new_fr.max_corner().get<0>() << "," << new_fr.max_corner().get<1>() << ")]" << std::endl;
+      }
+    }
+
+    total_merges++;
+    merge_size_dist[new_cluster.flops_.size()]++;
+
+    // Check if cluster can grow further
+    const bool can_merge_further = isFurtherMergeable(new_cluster, show_debug);
+
+    if (can_merge_further) {
+      // Intermediate merge: can still grow larger
+      intermediate_merges++;
+      
+      if (show_debug) {
+        std::cout << "  ▸ Decision: INTERMEDIATE (can grow to larger bit-width)" << std::endl;
+        std::cout << "    • Action: Update edges only" << std::endl;
+      }
+
+      updateEdges(new_cluster, show_debug);
+      
+      if (show_debug) {
+        const int new_edge_count = adj_list_.count(new_cluster_idx) ? adj_list_[new_cluster_idx].size() : 0;
+        std::cout << "    • New edges created: " << new_edge_count << std::endl;
+        
+        if (new_edge_count > 0 && new_edge_count <= 5) {
+          std::cout << "    • Top neighbors:" << std::endl;
+          int shown = 0;
+          for (const Edge& e : adj_list_[new_cluster_idx]) {
+            if (shown >= 3) break;
+            int neighbor_idx = (e.n1 == new_cluster_idx) ? e.n2 : e.n1;
+            std::cout << "      - Cluster[" << neighbor_idx << "]: size=" 
+                      << flop_clusters_[neighbor_idx].flops_.size() 
+                      << ", weight=" << std::fixed << std::setprecision(2) << e.weight << std::endl;
+            shown++;
+          }
+        }
+      }
     } 
     else {
-      flop_cluster_no_further_merge_[n_new_idx] = true;
+      // Final merge: reached maximum bit-width
+      final_merges++;
+      flop_cluster_no_further_merge_[new_cluster_idx] = true;
 
-      // Perform slack distribution if final cluster is formed      
-      std::set<int> affected_flop_units = distributeSlack(n_new); 
+      if (show_debug) {
+        std::cout << "  ▸ Decision: FINAL (reached maximum bit-width)" << std::endl;
+        std::cout << "    • Action: Distribute slack to neighbors" << std::endl;
+      }
+
+      // Distribute unused slack to connected flops
+      const std::set<int> affected_flop_units = distributeSlack(new_cluster, show_debug);
       
       std::set<int> affected_flop_clusters;
       
+      // Update feasible regions of affected flop units
       for (int u_idx : affected_flop_units) {
-        // Update feasible region of affected 'FlopUnit's
-        calcFeasibleRegion(flop_units_[u_idx]); 
+        calcFeasibleRegion(flop_units_[u_idx]);
         
-        // Get affected 'Cluster's for later FR and edge updates
-        int c_idx = flop_units_[u_idx].cluster_idx_;
+        // Collect affected clusters for later updates
+        const int c_idx = flop_units_[u_idx].cluster_idx_;
         if (flop_cluster_is_valid_[c_idx] && !flop_cluster_no_further_merge_[c_idx]) {
           affected_flop_clusters.insert(c_idx);
         }
       }
 
-      // Update feasible regions of affected 'Cluster's
-      for (int c_idx : affected_flop_clusters) {
-        updateFeasibleRegion(flop_clusters_[c_idx]);
+      if (show_debug) {
+        std::cout << "    • Affected flops: " << affected_flop_units.size() << std::endl;
+        std::cout << "    • Affected clusters: " << affected_flop_clusters.size() << std::endl;
       }
 
-      // Update edges of affected 'Cluster's
+      // Update feasible regions of affected clusters
       for (int c_idx : affected_flop_clusters) {
+        updateFeasibleRegion(flop_clusters_[c_idx], show_debug);
+      }
+
+      // Update edges of affected clusters
+      int total_new_edges = 0;
+      for (int c_idx : affected_flop_clusters) {
+        int before_count = adj_list_.count(c_idx) ? adj_list_[c_idx].size() : 0;
         updateEdges(flop_clusters_[c_idx]);
+        int after_count = adj_list_.count(c_idx) ? adj_list_[c_idx].size() : 0;
+        total_new_edges += (after_count - before_count);
+      }
+
+      if (show_debug) {
+        std::cout << "    • Total new edges from affected clusters: " << total_new_edges << std::endl;
       }
     }
+
+    iteration++;
+
+    // Periodic progress report
+    if (verbose_ && iteration % 100 == 0) {
+      std::cout << "\n  [Progress] Iteration " << iteration << std::endl;
+      std::cout << "    - Total merges: " << total_merges 
+                << " (intermediate: " << intermediate_merges 
+                << ", final: " << final_merges << ")" << std::endl;
+      std::cout << "    - Skipped (invalid): " << skipped_invalid << std::endl;
+      std::cout << "    - Remaining edges: " << edge_pq_.size() << std::endl;
+      std::cout << "    - Valid clusters: " << std::count(flop_cluster_is_valid_.begin(), 
+                                                          flop_cluster_is_valid_.end(), true) << std::endl;
+      
+      // Show current size distribution
+      std::cout << "    - Current merge size distribution:" << std::endl;
+      for (const auto& [size, count] : merge_size_dist) {
+        std::cout << "      * " << size << "-bit: " << count << " merge(s)" << std::endl;
+      }
+    }
+  }
+
+  if (verbose_) {
+    std::cout << "\n╔═══════════════════════════════════════════════════════════════╗" << std::endl;
+    std::cout << "║  FINAL CLUSTERING STATISTICS                                  ║" << std::endl;
+    std::cout << "╚═══════════════════════════════════════════════════════════════╝" << std::endl;
+    std::cout << "  Execution Summary:" << std::endl;
+    std::cout << "    • Total iterations: " << iteration << std::endl;
+    std::cout << "    • Total merges: " << total_merges 
+              << " (intermediate: " << intermediate_merges 
+              << ", final: " << final_merges << ")" << std::endl;
+    std::cout << "    • Skipped (invalid): " << skipped_invalid << std::endl;
+
+    // Count final valid clusters by size
+    std::map<int, int> cluster_size_dist;
+    std::map<int, std::vector<int>> size_to_clusters;  // For showing examples
+    int single_flop_clusters = 0;
+    int merged_clusters = 0;
+    int total_flops_in_mbff = 0;
+
+    for (size_t i = 0; i < flop_clusters_.size(); ++i) {
+      if (flop_cluster_is_valid_[i]) {
+        const int size = flop_clusters_[i].flops_.size();
+        cluster_size_dist[size]++;
+        size_to_clusters[size].push_back(i);
+        
+        if (size == 1) {
+          single_flop_clusters++;
+        } else {
+          merged_clusters++;
+          total_flops_in_mbff += size;
+        }
+      }
+    }
+
+    const int total_valid = single_flop_clusters + merged_clusters;
+    const int total_flops = flop_units_.size();
+    const float mbff_ratio = total_flops > 0 ? (100.0f * total_flops_in_mbff / total_flops) : 0.0f;
+
+    std::cout << "\n  Final Cluster Status:" << std::endl;
+    std::cout << "    • Total valid clusters: " << total_valid << std::endl;
+    std::cout << "    • Single-flop clusters: " << single_flop_clusters 
+              << " (" << std::fixed << std::setprecision(1) 
+              << (100.0f * single_flop_clusters / total_valid) << "%)" << std::endl;
+    std::cout << "    • Multi-bit clusters (MBFF): " << merged_clusters 
+              << " (" << (100.0f * merged_clusters / total_valid) << "%)" << std::endl;
+    std::cout << "    • Flops in MBFF: " << total_flops_in_mbff << " / " << total_flops 
+              << " (" << mbff_ratio << "%)" << std::endl;
+
+    if (!cluster_size_dist.empty()) {
+      std::cout << "\n  Cluster Size Distribution:" << std::endl;
+      int max_size = 0;
+      for (const auto& [size, count] : cluster_size_dist) {
+        max_size = std::max(max_size, size);
+        std::cout << "    • " << size << "-bit: " << count << " cluster(s)";
+        
+        // Show percentage for merged clusters
+        if (size > 1) {
+          float pct = 100.0f * count / merged_clusters;
+          std::cout << " (" << std::fixed << std::setprecision(1) << pct << "% of MBFF)";
+        }
+        std::cout << std::endl;
+      }
+      
+      std::cout << "    • Maximum bit-width achieved: " << max_size << std::endl;
+    }
+
+    // Show why clustering stopped
+    std::cout << "\n  Termination Analysis:" << std::endl;
+    if (edge_pq_.empty()) {
+      std::cout << "    • Reason: Edge queue exhausted (no more mergeable pairs)" << std::endl;
+      
+      // Analyze remaining clusters
+      int remaining_intermediate = 0;
+      int remaining_final = 0;
+      for (size_t i = 0; i < flop_clusters_.size(); ++i) {
+        if (flop_cluster_is_valid_[i]) {
+          if (flop_cluster_no_further_merge_[i]) {
+            remaining_final++;
+          } else {
+            remaining_intermediate++;
+          }
+        }
+      }
+      std::cout << "    • Remaining clusters that could grow: " << remaining_intermediate << std::endl;
+      std::cout << "    • Remaining final clusters: " << remaining_final << std::endl;
+      
+      if (remaining_intermediate > 0) {
+        std::cout << "    • ⚠ WARNING: " << remaining_intermediate 
+                  << " cluster(s) marked as intermediate but no edges found!" << std::endl;
+        std::cout << "      This suggests edge creation or compatibility issues." << std::endl;
+      }
+    }
+
+    // Show sample merged clusters
+    if (merged_clusters > 0) {
+      std::cout << "\n  Sample Multi-bit Clusters:" << std::endl;
+      
+      // Show largest clusters first
+      std::vector<std::pair<int, int>> size_count_pairs;
+      for (const auto& [size, count] : cluster_size_dist) {
+        if (size > 1) {
+          size_count_pairs.emplace_back(size, count);
+        }
+      }
+      std::sort(size_count_pairs.begin(), size_count_pairs.end(), 
+                [](const auto& a, const auto& b) { return a.first > b.first; });
+      
+      int samples_shown = 0;
+      constexpr int MAX_SAMPLES = 5;
+      
+      for (const auto& [size, count] : size_count_pairs) {
+        if (samples_shown >= MAX_SAMPLES) break;
+        
+        const auto& cluster_indices = size_to_clusters[size];
+        for (size_t i = 0; i < std::min(size_t(2), cluster_indices.size()) && samples_shown < MAX_SAMPLES; ++i) {
+          int c_idx = cluster_indices[i];
+          const FlopCluster& cluster = flop_clusters_[c_idx];
+          
+          std::cout << "    [" << (samples_shown + 1) << "] Cluster #" << c_idx 
+                    << ": " << size << "-bit MBFF" << std::endl;
+          std::cout << "        Position: (" << cluster.curr_pt_.x << ", " << cluster.curr_pt_.y << ")" << std::endl;
+          
+          const Box& fr = cluster.feasible_region_;
+          std::cout << "        Feasible region: ";
+          if (boost::geometry::is_empty(fr)) {
+            std::cout << "EMPTY";
+          } else {
+            std::cout << "[(" << fr.min_corner().get<0>() << "," << fr.min_corner().get<1>() 
+                      << ") -> (" << fr.max_corner().get<0>() << "," << fr.max_corner().get<1>() << ")]";
+          }
+          std::cout << std::endl;
+          
+          std::cout << "        Member flops: ";
+          int member_count = 0;
+          for (int flop_idx : cluster.flops_) {
+            if (member_count > 0) std::cout << ", ";
+            std::cout << flop_units_[flop_idx].inst_->getName();
+            member_count++;
+            if (member_count >= 3 && cluster.flops_.size() > 3) {
+              std::cout << " ... (+" << (cluster.flops_.size() - 3) << " more)";
+              break;
+            }
+          }
+          std::cout << std::endl;
+          
+          samples_shown++;
+        }
+      }
+    }
+
+    std::cout << "\n" << std::endl;
   }
 }
 
@@ -1941,6 +2448,10 @@ AggloCluster::getPortType(const sta::LibertyPort* lib_port, odb::dbInst* inst) c
 void
 AggloCluster::calcFeasibleRegion(FlopUnit& flop, bool verbose)
 {
+  // Save original precision settings
+  std::streamsize original_precision = std::cout.precision();
+  std::ios_base::fmtflags original_flags = std::cout.flags();
+  
   if (verbose) {
     std::cout << std::fixed << std::setprecision(18);
   }
@@ -2019,6 +2530,12 @@ AggloCluster::calcFeasibleRegion(FlopUnit& flop, bool verbose)
   all_pins.insert(all_pins.end(), qn_pins.begin(), qn_pins.end());
   
   computeFinalFeasibleRegion(flop, all_pins, verbose);
+  
+  // Restore original precision settings
+  if (verbose) {
+    std::cout.precision(original_precision);
+    std::cout.flags(original_flags);
+  }
 }
 
 
@@ -2152,6 +2669,7 @@ AggloCluster::processFanOutPin(FlopUnit& flop,
     const float coeff = coeffs[seg_idx];
     const float segment_cap_min = cap_delay[seg_idx].first;
     const float segment_cap_max = cap_delay[seg_idx + 1].first;
+    const bool is_last_iteration = (seg_idx == coeffs.size() - 1);
     
     if (verbose) {
       std::cout << "      Trying segment [" << seg_idx << "-" << (seg_idx+1) << "]:" << std::endl;
@@ -2188,6 +2706,14 @@ AggloCluster::processFanOutPin(FlopUnit& flop,
       if (verbose) {
         std::cout << "        ✗ Invalid. Capacitance outside segment range." << std::endl;
       }
+      // Special handling for last iteration: use candidate_dist even if out of range
+      if (is_last_iteration) {
+        max_dist = candidate_dist;
+        found_valid_segment = true;
+        if (verbose) {
+          std::cout << "        ⚠ Last iteration: Using candidate_dist despite out-of-range cap: " << candidate_dist << std::endl;
+        }
+      }
     }
   }
   
@@ -2200,12 +2726,31 @@ AggloCluster::processFanOutPin(FlopUnit& flop,
   
   max_dist = metersToDbu(max_dist);
 
+  // Apply bin size constraint: ensure max_dist is in [l1, l1 + bin_size * k]
+  const double bin_size_x = virtual_bin_grid_.getBinSizeX();
+  const double bin_size_y = virtual_bin_grid_.getBinSizeY();
+  const double avg_bin_size = (bin_size_x + bin_size_y) / 2.0;
+  const float l1_dbu = metersToDbu(l1);
+  const float lower_limit = l1_dbu;
+  const float upper_limit = l1_dbu + (avg_bin_size * feasible_region_bin_multiplier_);
+  
+  if (verbose) {
+    std::cout << "      Applying distance constraint:" << std::endl;
+    std::cout << "        Calculated max_dist: " << max_dist << " DBU" << std::endl;
+    std::cout << "        Lower bound (l1): " << lower_limit << " DBU" << std::endl;
+    std::cout << "        Bin size (avg): " << avg_bin_size << " DBU" << std::endl;
+    std::cout << "        Bin multiplier: " << feasible_region_bin_multiplier_ << std::endl;
+    std::cout << "        Upper bound (l1 + bin*k): " << upper_limit << " DBU" << std::endl;
+  }
+  
+  max_dist = std::clamp(max_dist, lower_limit, upper_limit);
+
   const int steiner_x = steiner_location.getX();
   const int steiner_y = steiner_location.getY();
   
   if (verbose) {
     std::cout << "    Maximum placement distance:" << std::endl;
-    std::cout << "      Max Manhattan distance from Steiner: " << max_dist << " DBU" << std::endl;
+    std::cout << "      Final max_dist: " << max_dist << " DBU" << std::endl;
     std::cout << "    Result: Feasible region centered at (" << steiner_x << ", " << steiner_y << ")" << std::endl;
   }
   
@@ -2471,6 +3016,7 @@ AggloCluster::processFanInPin(FlopUnit& flop,
     const float coeff = coeffs[seg_idx];
     const float segment_cap_min = cap_delay[seg_idx].first;
     const float segment_cap_max = cap_delay[seg_idx + 1].first;
+    const bool is_last_iteration = (seg_idx == coeffs.size() - 1);
     
     if (verbose) {
       std::cout << "      Trying segment [" << seg_idx << "-" << (seg_idx+1) 
@@ -2505,6 +3051,14 @@ AggloCluster::processFanInPin(FlopUnit& flop,
       if (verbose) {
         std::cout << "      ✗ Resulting cap out of range for this segment" << std::endl;
       }
+      // Special handling for last iteration: use candidate_dist even if out of range
+      if (is_last_iteration) {
+        max_dist = candidate_dist;
+        found_valid_segment = true;
+        if (verbose) {
+          std::cout << "      ⚠ Last iteration: Using candidate_dist despite out-of-range cap: " << candidate_dist << std::endl;
+        }
+      }
     }
   }
   
@@ -2517,9 +3071,28 @@ AggloCluster::processFanInPin(FlopUnit& flop,
   
   max_dist = metersToDbu(max_dist);
 
+  // Apply bin size constraint: ensure max_dist is in [l1, l1 + bin_size * k]
+  const double bin_size_x = virtual_bin_grid_.getBinSizeX();
+  const double bin_size_y = virtual_bin_grid_.getBinSizeY();
+  const double avg_bin_size = (bin_size_x + bin_size_y) / 2.0;
+  const float l1_dbu = metersToDbu(l1);
+  const float lower_limit = l1_dbu;
+  const float upper_limit = l1_dbu + (avg_bin_size * feasible_region_bin_multiplier_);
+  
+  if (verbose) {
+    std::cout << "      Applying distance constraint:" << std::endl;
+    std::cout << "        Calculated max_dist: " << max_dist << " DBU" << std::endl;
+    std::cout << "        Lower bound (l1): " << lower_limit << " DBU" << std::endl;
+    std::cout << "        Bin size (avg): " << avg_bin_size << " DBU" << std::endl;
+    std::cout << "        Bin multiplier: " << feasible_region_bin_multiplier_ << std::endl;
+    std::cout << "        Upper bound (l1 + bin*k): " << upper_limit << " DBU" << std::endl;
+  }
+  
+  max_dist = std::clamp(max_dist, lower_limit, upper_limit);
+
   if (verbose) {
     std::cout << "    Maximum placement distance:" << std::endl;
-    std::cout << "      Max Manhattan distance from Steiner: " << max_dist << " DBU" << std::endl;
+    std::cout << "      Final max_dist: " << max_dist << " DBU" << std::endl;
     std::cout << "    Result: Feasible region centered at (" << top_x << ", " << top_y << ")" << std::endl;
   }
   
@@ -2591,31 +3164,6 @@ AggloCluster::computeFinalFeasibleRegion(FlopUnit& flop,
                   << final_region.max_corner().get<0>() << ", " << final_region.max_corner().get<1>() 
                   << ")]" << std::endl;
       }
-    }
-  }
-  
-  // If all pins had inverse boxes, use core area
-  if (!has_valid_region) {
-    if (verbose) {
-      std::cout << "    No valid pin constraints - using core area" << std::endl;
-    }
-    
-    const odb::Rect& core_area = block_->getCoreArea();
-    const Point core_min_orig(core_area.xMin(), core_area.yMin());
-    const Point core_max_orig(core_area.xMax(), core_area.yMax());
-    const Point core_min_tf = transformCoords(core_min_orig);
-    const Point core_max_tf = transformCoords(core_max_orig);
-    
-    const int min_x = std::min(core_min_tf.get<0>(), core_max_tf.get<0>());
-    const int max_x = std::max(core_min_tf.get<0>(), core_max_tf.get<0>());
-    const int min_y = std::min(core_min_tf.get<1>(), core_max_tf.get<1>());
-    const int max_y = std::max(core_min_tf.get<1>(), core_max_tf.get<1>());
-    
-    final_region = Box(Point(min_x, min_y), Point(max_x, max_y));
-    
-    if (verbose) {
-      std::cout << "    Core area transformed: [(" << min_x << ", " << min_y 
-                << ") - (" << max_x << ", " << max_y << ")]" << std::endl;
     }
   }
   
@@ -3007,33 +3555,499 @@ AggloCluster::getTerminalSlew(odb::dbITerm* terminal,
   return sta_->vertexSlew(load_vertex, min_max);
 }
 
+//==============================================================================
+// Phase 9 Helper Functions: Compatibility Graph Generation
+//==============================================================================
+
 // -----------------------------------------------------------------------------
-// [Level 3] Quadratic equation solving for max distance calculation
+// [Level 1] Top-level: Build/update compatibility graph edges
 // -----------------------------------------------------------------------------
 
-std::unordered_map<odb::dbITerm*, std::pair<int, sta::Slack>> 
-AggloCluster::calcUsedSlacks(const FlopUnit& flop_unit) const 
+void 
+AggloCluster::updateEdges(const FlopCluster& cluster, bool verbose)
 {
-  throw std::logic_error("calcUsedSlacks not implemented");
+  const int i = cluster.id_;
+
+  if (verbose) {
+    std::cout << "\n[updateEdges] Processing Cluster #" << i << std::endl;
+    std::cout << "  Cluster size: " << cluster.flops_.size() << " flop(s)" << std::endl;
+    std::cout << "  Current position: (" << cluster.curr_pt_.x << ", " << cluster.curr_pt_.y << ")" << std::endl;
+  }
+
+  if (!flop_cluster_is_valid_[i] || flop_cluster_no_further_merge_[i]) {
+    if (verbose) {
+      std::cout << "  Status: Skipped (";
+      if (!flop_cluster_is_valid_[i]) {
+        std::cout << "invalid";
+      } else {
+        std::cout << "no further merge";
+      }
+      std::cout << ")" << std::endl;
+    }
+    return;
+  }
+
+  if (boost::geometry::is_empty(cluster.feasible_region_)) {
+    if (verbose) {
+      std::cout << "  Status: Skipped (empty feasible region)" << std::endl;
+      std::cout << "  ⚠ This cluster cannot create edges - feasible region is empty!" << std::endl;
+    }
+    return;
+  }
+
+  if (verbose) {
+    const Box& fr = cluster.feasible_region_;
+    Point min_uv = fr.min_corner();
+    Point max_uv = fr.max_corner();
+    int u_min = min_uv.get<0>();
+    int v_min = min_uv.get<1>();
+    int u_max = max_uv.get<0>();
+    int v_max = max_uv.get<1>();
+    
+    // Four corners of the UV box
+    Point corner1_xy = inverseTransformCoords(Point(u_min, v_min));
+    Point corner2_xy = inverseTransformCoords(Point(u_max, v_min));
+    Point corner3_xy = inverseTransformCoords(Point(u_max, v_max));
+    Point corner4_xy = inverseTransformCoords(Point(u_min, v_max));
+    
+    std::cout << "  Feasible region (UV rotated): [(" 
+              << u_min << ", " << v_min << ") - ("
+              << u_max << ", " << v_max << ")]" << std::endl;
+    std::cout << "  Feasible region (XY original, diamond shape):" << std::endl;
+    std::cout << "    Corner1: (" << corner1_xy.get<0>() << ", " << corner1_xy.get<1>() << ")" << std::endl;
+    std::cout << "    Corner2: (" << corner2_xy.get<0>() << ", " << corner2_xy.get<1>() << ")" << std::endl;
+    std::cout << "    Corner3: (" << corner3_xy.get<0>() << ", " << corner3_xy.get<1>() << ")" << std::endl;
+    std::cout << "    Corner4: (" << corner4_xy.get<0>() << ", " << corner4_xy.get<1>() << ")" << std::endl;
+    
+    // Verify R-Tree query before using it
+    std::cout << "  ▸ Verifying R-Tree query for this cluster..." << std::endl;
+  }
+
+  std::vector<FlopClusterEntry> intersecting_entries = getIntersectedCluster(cluster, verbose);
+
+  if (verbose) {
+    std::cout << "  ▸ R-Tree query result: " << intersecting_entries.size() << " intersecting cluster(s)" << std::endl;
+    
+    // Check if this cluster finds itself in the R-Tree
+    bool found_self = false;
+    for (const auto& [box, idx] : intersecting_entries) {
+      if (idx == i) {
+        found_self = true;
+        break;
+      }
+    }
+    
+    if (found_self) {
+      std::cout << "    ✓ Self-intersection detected (normal - cluster finds itself)" << std::endl;
+    } else {
+      std::cout << "    ⚠ WARNING: Cluster does NOT find itself in R-Tree!" << std::endl;
+      std::cout << "    This may indicate R-Tree indexing issue" << std::endl;
+    }
+    
+    // Show distribution of intersecting cluster sizes
+    if (!intersecting_entries.empty()) {
+      std::map<int, int> size_dist;
+      for (const auto& [box, idx] : intersecting_entries) {
+        if (idx != i && flop_cluster_is_valid_[idx]) {
+          int size = flop_clusters_[idx].flops_.size();
+          size_dist[size]++;
+        }
+      }
+      
+      if (!size_dist.empty()) {
+        std::cout << "    • Intersecting cluster sizes: ";
+        bool first = true;
+        for (const auto& [size, count] : size_dist) {
+          if (!first) std::cout << ", ";
+          std::cout << size << "-bit(" << count << ")";
+          first = false;
+        }
+        std::cout << std::endl;
+      }
+    }
+  }
+
+  int valid_candidates = 0;
+  int skipped_lower_id = 0;
+  int skipped_invalid = 0;
+  int skipped_incompatible = 0;
+  int skipped_no_placement = 0;
+  int edges_created = 0;
+
+  for (const auto& entry : intersecting_entries) {
+    const int j = entry.second;
+
+    // Skip self-edges
+    if (i == j) {
+      continue;
+    }
+
+    // Skip if edge already exists between i and j
+    bool edge_exists = false;
+    for (const auto& edge : adj_list_[i]) {
+      if ((edge.n1 == i && edge.n2 == j) || (edge.n1 == j && edge.n2 == i)) {
+        edge_exists = true;
+        break;
+      }
+    }
+    
+    if (edge_exists) {
+      skipped_lower_id++;  // Reuse this counter for "already has edge"
+      continue;
+    }
+
+    if (!flop_cluster_is_valid_[j] || flop_cluster_no_further_merge_[j]) {
+      skipped_invalid++;
+      continue;
+    }
+
+    const FlopCluster& adj_cluster = flop_clusters_[j];
+
+    if (!checkCompatibility(cluster, adj_cluster, verbose && valid_candidates < 3)) {
+      skipped_incompatible++;
+      continue;
+    }
+
+    valid_candidates++;
+
+    PlacementCandidate pc = calcPlacementCandidate(cluster, adj_cluster, verbose && edges_created < 3);
+
+    if (!pc.is_valid_) {
+      skipped_no_placement++;
+      continue;
+    }
+
+    Edge new_edge(i, j, pc.merge_gain_, pc.placement_pos_);
+
+    edge_pq_.insert(new_edge);
+    adj_list_[i].insert(new_edge);
+    adj_list_[j].insert(new_edge);
+    edges_created++;
+
+    if (verbose && edges_created <= 3) {
+      std::cout << "    Edge #" << edges_created << " created with Cluster[" << j << "]" << std::endl;
+      std::cout << "      HPWL gain: " << std::fixed << std::setprecision(2) << pc.merge_gain_ 
+                << (pc.merge_gain_ < 0 ? " (improvement)" : " (degradation)") << std::endl;
+      std::cout << "      Merge position: (" << pc.placement_pos_.x << ", " << pc.placement_pos_.y << ")" << std::endl;
+      std::cout << "      Adjacent cluster size: " << adj_cluster.flops_.size() << " flop(s)" << std::endl;
+      std::cout << "      Merged size would be: " << (cluster.flops_.size() + adj_cluster.flops_.size()) << " flop(s)" << std::endl;
+    }
+  }
+
+  if (verbose) {
+    std::cout << "  Edge creation summary:" << std::endl;
+    std::cout << "    - Intersecting clusters: " << intersecting_entries.size() << std::endl;
+    std::cout << "    - Skipped (edge already exists): " << skipped_lower_id << std::endl;
+    std::cout << "    - Skipped (invalid/no-merge): " << skipped_invalid << std::endl;
+    std::cout << "    - Compatible candidates: " << valid_candidates << std::endl;
+    std::cout << "    - Skipped (incompatible masks): " << skipped_incompatible << std::endl;
+    std::cout << "    - Skipped (no valid placement): " << skipped_no_placement << std::endl;
+    std::cout << "    - Edges successfully created: " << edges_created << std::endl;
+    if (edges_created > 3) {
+      std::cout << "      (showing first 3 edges only)" << std::endl;
+    }
+  }
 }
 
-//==============================================================================
-// FlopCluster Helper Functions
-//==============================================================================
+// -----------------------------------------------------------------------------
+// [Level 2] Main logic for edge creation
+// -----------------------------------------------------------------------------
+
+std::vector<FlopClusterEntry>
+AggloCluster::getIntersectedCluster(const FlopCluster& cluster, bool verbose) const
+{
+  std::vector<FlopClusterEntry> intersecting_clusters;
+
+  if (boost::geometry::is_empty(cluster.feasible_region_)) {
+    if (verbose) {
+      std::cout << "      [getIntersectedCluster] Empty feasible region - returning 0 clusters" << std::endl;
+    }
+    return intersecting_clusters;
+  }
+
+  feasible_regions_.query(bgi::intersects(cluster.feasible_region_),
+                          std::back_inserter(intersecting_clusters));
+
+  if (verbose) {
+    std::cout << "      [getIntersectedCluster] RTree query completed" << std::endl;
+    std::cout << "        Intersecting clusters found: " << intersecting_clusters.size() << std::endl;
+    
+    if (intersecting_clusters.size() > 0 && intersecting_clusters.size() <= 5) {
+      std::cout << "        Cluster IDs: ";
+      for (size_t i = 0; i < intersecting_clusters.size(); ++i) {
+        std::cout << intersecting_clusters[i].second;
+        if (i < intersecting_clusters.size() - 1) {
+          std::cout << ", ";
+        }
+      }
+      std::cout << std::endl;
+    }
+  }
+
+  return intersecting_clusters;
+}
+
+bool 
+AggloCluster::checkCompatibility(const FlopCluster& c1,
+                                 const FlopCluster& c2,
+                                 bool verbose) const
+{
+  if (verbose) {
+    std::cout << "      [checkCompatibility] Checking clusters " << c1.id_ << " and " << c2.id_ << std::endl;
+  }
+
+  // Check mask compatibility
+  bool masks_match = (c1.master_mask_ == c2.master_mask_
+                      && c1.inst_mask_ == c2.inst_mask_);
+  
+  if (verbose) {
+    std::cout << "        Master mask match: " << (c1.master_mask_ == c2.master_mask_ ? "YES" : "NO") << std::endl;
+    std::cout << "        Inst mask match: " << (c1.inst_mask_ == c2.inst_mask_ ? "YES" : "NO") << std::endl;
+  }
+
+  if (!masks_match) {
+    if (verbose) {
+      std::cout << "        Result: INCOMPATIBLE (mask mismatch)" << std::endl;
+    }
+    return false;
+  }
+
+  // Check if merged size is supported
+  size_t total_flops = c1.flops_.size() + c2.flops_.size();
+  
+  if (verbose) {
+    std::cout << "        Cluster sizes: " << c1.flops_.size() << " + " << c2.flops_.size() 
+              << " = " << total_flops << " flop(s)" << std::endl;
+  }
+
+  auto it = compatible_masters_.find(c1.master_mask_);
+
+  if (it != compatible_masters_.end()) {
+    const auto& bits_to_masters = it->second;
+    bool has_master = bits_to_masters.count(total_flops) > 0;
+    
+    if (verbose) {
+      std::cout << "        Master available for " << total_flops << "-bit: " 
+                << (has_master ? "YES" : "NO") << std::endl;
+      if (!has_master) {
+        std::cout << "        Available bit widths: ";
+        for (const auto& [bits, masters] : bits_to_masters) {
+          std::cout << bits << " ";
+        }
+        std::cout << std::endl;
+      }
+      std::cout << "        Result: " << (has_master ? "COMPATIBLE" : "INCOMPATIBLE (no master)") << std::endl;
+    }
+    
+    return has_master;
+  }
+
+  if (verbose) {
+    std::cout << "        Result: INCOMPATIBLE (mask not found in compatible_masters)" << std::endl;
+  }
+
+  return false;
+}
+
+PlacementCandidate
+AggloCluster::calcPlacementCandidate(const FlopCluster& c1, const FlopCluster& c2, bool verbose)
+{
+  if (verbose) {
+    std::cout << "      [calcPlacementCandidate] Computing placement for clusters " 
+              << c1.id_ << " and " << c2.id_ << std::endl;
+  }
+
+  // Get masters for both clusters and the merged result
+  const MasterMask& mask = c1.master_mask_;
+  
+  auto get_cluster_master = [&, this](const FlopCluster& c) -> odb::dbMaster* {
+    int bits = c.flops_.size();
+    if (bits == 1) {
+      int flop_id = *c.flops_.begin();
+      return flop_units_[flop_id].inst_->getMaster();
+    } else {
+      auto mask_it = representative_masters_.find(c.master_mask_);
+      if (mask_it == representative_masters_.end()) {
+        return nullptr;
+      }
+      auto bit_it = mask_it->second.find(bits);
+      if (bit_it == mask_it->second.end()) {
+        return nullptr;
+      }
+      return bit_it->second;
+    }
+  };
+  
+  odb::dbMaster* master1 = get_cluster_master(c1);
+  odb::dbMaster* master2 = get_cluster_master(c2);
+  
+  // Find the master for merged cluster
+  int new_bits = c1.flops_.size() + c2.flops_.size();
+  odb::dbMaster* new_master = nullptr;
+  auto mask_it = representative_masters_.find(mask);
+  if (mask_it != representative_masters_.end()) {
+    auto bit_it = mask_it->second.find(new_bits);
+    if (bit_it != mask_it->second.end()) {
+      new_master = bit_it->second;
+    }
+  }
+
+  if (verbose) {
+    std::cout << "        Master lookup:" << std::endl;
+    std::cout << "          Cluster[" << c1.id_ << "] (" << c1.flops_.size() << "-bit): " 
+              << (master1 ? master1->getName() : "NULL") << std::endl;
+    std::cout << "          Cluster[" << c2.id_ << "] (" << c2.flops_.size() << "-bit): " 
+              << (master2 ? master2->getName() : "NULL") << std::endl;
+    std::cout << "          Merged (" << new_bits << "-bit): " 
+              << (new_master ? new_master->getName() : "NULL") << std::endl;
+  }
+
+  // Return invalid if required masters are unavailable
+  if (master1 == nullptr || master2 == nullptr || new_master == nullptr) {
+    if (verbose) {
+      std::cout << "        Result: INVALID (missing master)" << std::endl;
+    }
+    return PlacementCandidate(c1.curr_pt_, 0.0, false);
+  }
+
+  // Calculate HPWL-optimal bounding box in XY coordinates
+  const Box hpwl_box_xy = calcMedianBox(c1, c2);
+
+  if (verbose) {
+    std::cout << "        HPWL-optimal box (XY): [(" 
+              << hpwl_box_xy.min_corner().get<0>() << ", "
+              << hpwl_box_xy.min_corner().get<1>() << ") - ("
+              << hpwl_box_xy.max_corner().get<0>() << ", "
+              << hpwl_box_xy.max_corner().get<1>() << ")]" << std::endl;
+  }
+
+  // Get timing-feasible region intersection in UV coordinates
+  const Box fr_box_uv = getFeasibleRegionIntersection(c1, c2);
+  if (boost::geometry::is_empty(fr_box_uv)) {
+    if (verbose) {
+      std::cout << "        Result: INVALID (empty feasible region intersection)" << std::endl;
+    }
+    return PlacementCandidate(c1.curr_pt_, 0.0, false);
+  }
+
+  if (verbose) {
+    Point fr_min_uv = fr_box_uv.min_corner();
+    Point fr_max_uv = fr_box_uv.max_corner();
+    int u_min = fr_min_uv.get<0>();
+    int v_min = fr_min_uv.get<1>();
+    int u_max = fr_max_uv.get<0>();
+    int v_max = fr_max_uv.get<1>();
+    
+    // Four corners of the UV box
+    Point corner1_xy = inverseTransformCoords(Point(u_min, v_min));
+    Point corner2_xy = inverseTransformCoords(Point(u_max, v_min));
+    Point corner3_xy = inverseTransformCoords(Point(u_max, v_max));
+    Point corner4_xy = inverseTransformCoords(Point(u_min, v_max));
+    
+    std::cout << "        Feasible region (UV rotated): [(" 
+              << u_min << ", " << v_min << ") - ("
+              << u_max << ", " << v_max << ")]" << std::endl;
+    std::cout << "        Feasible region (XY original, diamond shape):" << std::endl;
+    std::cout << "          Corner1: (" << corner1_xy.get<0>() << ", " << corner1_xy.get<1>() << ")" << std::endl;
+    std::cout << "          Corner2: (" << corner2_xy.get<0>() << ", " << corner2_xy.get<1>() << ")" << std::endl;
+    std::cout << "          Corner3: (" << corner3_xy.get<0>() << ", " << corner3_xy.get<1>() << ")" << std::endl;
+    std::cout << "          Corner4: (" << corner4_xy.get<0>() << ", " << corner4_xy.get<1>() << ")" << std::endl;
+  }
+
+  // Project HPWL-optimal point onto feasible region
+  Point P_proj_xy = project(hpwl_box_xy, fr_box_uv);
+
+  if (verbose) {
+    std::cout << "        Projected optimal point (XY): (" 
+              << P_proj_xy.get<0>() << ", " << P_proj_xy.get<1>() << ")" << std::endl;
+  }
+
+  // Generate uniform samples within feasible region
+  std::vector<Point> xy_candidates = generateUniformSamples(fr_box_uv, 16);
+  xy_candidates.push_back(P_proj_xy);
+
+  if (verbose) {
+    std::cout << "        Generated " << xy_candidates.size() << " candidate positions" << std::endl;
+  }
+
+  // Sort candidates by Manhattan distance to projected point
+  auto manhattan_dist = [](const Point& a, const Point& b) {
+    int64_t dx = std::abs(static_cast<int64_t>(a.get<0>()) - static_cast<int64_t>(b.get<0>()));
+    int64_t dy = std::abs(static_cast<int64_t>(a.get<1>()) - static_cast<int64_t>(b.get<1>()));
+    return dx + dy;
+  };
+
+  std::sort(xy_candidates.begin(),
+            xy_candidates.end(),
+            [&](const Point& a, const Point& b) {
+              return manhattan_dist(a, P_proj_xy) < manhattan_dist(b, P_proj_xy);
+            });
+
+  if (verbose) {
+    std::cout << "        Evaluating candidates (sorted by Manhattan distance):" << std::endl;
+  }
+
+  // Evaluate candidates in order of proximity to optimal point
+  int candidate_idx = 0;
+  for (const auto& xy_cand_int : xy_candidates) { 
+    
+    if (verbose && candidate_idx < 3) {
+      std::cout << "          Candidate #" << candidate_idx << ": (" 
+                << xy_cand_int.get<0>() << ", " << xy_cand_int.get<1>() << ")" << std::endl;
+      int64_t dist = manhattan_dist(xy_cand_int, P_proj_xy);
+      std::cout << "            Manhattan distance to optimal: " << dist << std::endl;
+    }
+
+    // Check if placement satisfies density constraint
+    if (checkPlacementDensityConstraint(c1, master1, c2, master2, xy_cand_int, new_master)) {
+      
+      // Convert to float coordinates
+      FloatPoint xy_cand_float(static_cast<float>(xy_cand_int.get<0>()),
+                               static_cast<float>(xy_cand_int.get<1>()));
+
+      if (verbose) {
+        std::cout << "            Density check: PASSED" << std::endl;
+      }
+      
+      // Calculate HPWL gain: negative value indicates improvement
+      double gain = calcMergeHPWLGain(c1, c2, xy_cand_float, verbose);
+
+      if (verbose) {
+        std::cout << "        Result: VALID (selected candidate #" << candidate_idx << ")" << std::endl;
+      }
+
+      // Return first valid candidate
+      return PlacementCandidate(xy_cand_float, gain, true);
+    } else {
+      if (verbose && candidate_idx < 3) {
+        std::cout << "            Density check: FAILED (overflow)" << std::endl;
+      }
+    }
+
+    candidate_idx++;
+  }
+
+  // All candidates failed density check
+  if (verbose) {
+    std::cout << "        Result: INVALID (all " << xy_candidates.size() 
+              << " candidates failed density check)" << std::endl;
+  }
+  return PlacementCandidate(c1.curr_pt_, 0.0, false);
+}
+
+// -----------------------------------------------------------------------------
+// [Level 3] Helpers for placement candidate calculation
+// -----------------------------------------------------------------------------
 
 Box 
-AggloCluster::calcMedianBox(const FlopCluster& c1,
-                            const FlopCluster& c2) const
-
+AggloCluster::calcMedianBox(const FlopCluster& c1, const FlopCluster& c2) const
 {
-  std::set<std::variant<odb::dbITerm*, odb::dbBTerm*>> connected_pins
-      = getConnectedPins(c1);
-
-  std::set<std::variant<odb::dbITerm*, odb::dbBTerm*>> pins_from_c2
-      = getConnectedPins(c2);
-
+  // Collect all external pins connected to both clusters
+  std::set<std::variant<odb::dbITerm*, odb::dbBTerm*>> connected_pins = getConnectedPins(c1);
+  std::set<std::variant<odb::dbITerm*, odb::dbBTerm*>> pins_from_c2 = getConnectedPins(c2);
   connected_pins.insert(pins_from_c2.begin(), pins_from_c2.end());
 
+  // Extract pin coordinates
   std::vector<int> x_coords;
   std::vector<int> y_coords;
 
@@ -3048,8 +4062,7 @@ AggloCluster::calcMedianBox(const FlopCluster& c1,
               x_coords.push_back(pin_x);
               y_coords.push_back(pin_y);
             }
-          }
-          else if constexpr (std::is_same_v<T, odb::dbBTerm*>) {
+          } else if constexpr (std::is_same_v<T, odb::dbBTerm*>) {
             odb::Rect bbox = pin->getBBox();
             if (!bbox.isInverted()) {
               x_coords.push_back(bbox.xCenter());
@@ -3060,6 +4073,7 @@ AggloCluster::calcMedianBox(const FlopCluster& c1,
         pin_variant);
   }
 
+  // Calculate median box (lower and upper medians)
   size_t n = x_coords.size();
   std::sort(x_coords.begin(), x_coords.end());
   std::sort(y_coords.begin(), y_coords.end());
@@ -3070,290 +4084,6 @@ AggloCluster::calcMedianBox(const FlopCluster& c1,
   int max_y = y_coords[n / 2];
 
   return Box(Point(min_x, min_y), Point(max_x, max_y));
-}
-
-PlacementCandidate
-AggloCluster::calcPlacementCandidate(const FlopCluster& c1, const FlopCluster& c2)
-{
-  // --- 0. 병합될 마스터 정보 가져오기 ---
-  const MasterMask& mask = c1.master_mask_; // (c1, c2 마스크는 동일)
-
-  // 클러스터의 현재 마스터를 가져오는 헬퍼 람다
-  auto get_cluster_master = [&, this](const FlopCluster& c) -> odb::dbMaster* {
-    int bits = c.flops_.size();
-    if (bits == 1) {
-      // 1-bit (Single cluster) -> FlopUnit에서 직접 가져옴
-      int flop_id = *c.flops_.begin();
-      return flop_units_[flop_id].inst_->getMaster();
-    } else {
-      // 2-bit 이상 (Merged cluster) -> 대표 마스터 맵에서 가져옴
-      auto mask_it = representative_masters_.find(c.master_mask_);
-      if (mask_it == representative_masters_.end()) return nullptr;
-      auto bit_it = mask_it->second.find(bits);
-      if (bit_it == mask_it->second.end()) return nullptr;
-      return bit_it->second;
-    }
-  };
-  
-  odb::dbMaster* master1 = get_cluster_master(c1);
-  odb::dbMaster* master2 = get_cluster_master(c2);
-  
-  // 병합될 새 마스터는 항상 representative_masters_ 맵에서 찾아야 함
-  int new_bits = c1.flops_.size() + c2.flops_.size();
-  odb::dbMaster* new_master = nullptr;
-  auto mask_it = representative_masters_.find(mask);
-  if (mask_it != representative_masters_.end()) {
-    auto bit_it = mask_it->second.find(new_bits);
-    if (bit_it != mask_it->second.end()) {
-      new_master = bit_it->second;
-    }
-  }
-
-  // 병합에 필요한 마스터 정보가 없는 경우 (e.g., 3-bit, 5-bit 마스터가 없음)
-  if (master1 == nullptr || master2 == nullptr || new_master == nullptr) {
-    return PlacementCandidate(c1.curr_pt_, 0.0, false);
-  }
-
-  // --- 1. HPWL 최적 박스 (XY 공간) ---
-  const Box hpwl_box_xy = calcMedianBox(c1, c2);
-
-  // --- 2. 타이밍 Feasible Region (UV 공간) ---
-  const Box fr_box_uv = getFeasibleRegionIntersection(c1, c2);
-  if (boost::geometry::is_empty(fr_box_uv)) {
-    // 공통된 Feasible Region이 없으면 병합 불가
-    return PlacementCandidate(c1.curr_pt_, 0.0, false);
-  }
-
-  // --- 3. HPWL 최적점 프로젝션 (project 함수가 XY 좌표 반환) ---
-  Point P_proj_xy = project(hpwl_box_xy, fr_box_uv);
-
-  // --- 4. Feasible Region 샘플링 (generateUniformSamples가 XY 좌표 반환) ---
-  std::vector<Point> xy_candidates = generateUniformSamples(fr_box_uv, 16);
-  xy_candidates.push_back(P_proj_xy); // 프로젝션 포인트도 후보에 추가
-
-  // --- 5. 후보군들을 P_proj_xy (XY 좌표)에 가까운 순서로 정렬 ---
-  // (정렬 기준: XY 공간에서의 유클리드 거리 제곱)
-  auto dist_sq_xy = [](const Point& a, const Point& b) {
-    // [수정] .get<>() 멤버 함수 사용
-    int64_t dx = a.get<0>() - b.get<0>();
-    int64_t dy = a.get<1>() - b.get<1>();
-    return dx * dx + dy * dy;
-  };
-
-  std::sort(xy_candidates.begin(),
-            xy_candidates.end(),
-            [&](const Point& a, const Point& b) {
-              // P_proj_xy를 기준으로 정렬
-              return dist_sq_xy(a, P_proj_xy) < dist_sq_xy(b, P_proj_xy);
-            });
-
-  // --- 6. 정렬된 후보군(XY)을 순회하며 검사 ---
-  for (const auto& xy_cand_int : xy_candidates) { 
-    
-    // 밀도 제약 검사
-    if (checkPlacementDensityConstraint(c1, master1, c2, master2, xy_cand_int, new_master)) {
-      
-      // 밀도 통과! -> FloatPoint로 변환
-      FloatPoint xy_cand_float(static_cast<float>(xy_cand_int.get<0>()),
-                               static_cast<float>(xy_cand_int.get<1>()));
-
-      // HPWL diff 계산
-      double hpwl_diff = calcHPWLDiff(c1, c2, xy_cand_float);
-      double gain = -hpwl_diff; // HPWL 감소량이 gain
-
-      // 배치 가능한 첫 번째 후보를 즉시 반환
-      return PlacementCandidate(xy_cand_float, gain, true);
-    }
-  }
-
-  // --- 7. 모든 후보가 밀도 제약에 실패한 경우 ---
-  return PlacementCandidate(c1.curr_pt_, 0.0, false);
-}
-
-double 
-AggloCluster::calcHPWLDiff(const FlopCluster& c1,
-                            const FlopCluster& c2,
-                            const FloatPoint& new_pos) const
-  {
-  double old_hpwl = 0.0;
-  double new_hpwl = 0.0;
-
-  auto pins1 = getConnectedPins(c1);
-  for (const auto& pin_variant : pins1) {
-    FloatPoint pin_loc = getPinCoordinate(pin_variant);
-    old_hpwl += calcManhattanDistance(pin_loc, c1.curr_pt_); 
-  }
-
-  auto pins2 = getConnectedPins(c2);
-  for (const auto& pin_variant : pins2) {
-    FloatPoint pin_loc = getPinCoordinate(pin_variant);
-    old_hpwl += calcManhattanDistance(pin_loc, c2.curr_pt_); 
-  }
-
-  std::set<std::variant<odb::dbITerm*, odb::dbBTerm*>> all_pins = pins1;
-  all_pins.insert(pins2.begin(), pins2.end()); 
-
-  for (const auto& pin_variant : all_pins) {
-    FloatPoint pin_loc = getPinCoordinate(pin_variant);
-    new_hpwl += calcManhattanDistance(pin_loc, new_pos); 
-  }
-
-  return new_hpwl - old_hpwl; 
-}
-
-bool 
-AggloCluster::checkCompatibility(const FlopCluster& c1,
-                                      const FlopCluster& c2) const
-{
-  if (!(c1.master_mask_ == c2.master_mask_
-        && c1.inst_mask_ == c2.inst_mask_)) {
-    return false;
-  }
-
-  size_t total_flops = c1.flops_.size() + c2.flops_.size();
-  auto it = compatible_masters_.find(c1.master_mask_);
-
-  if (it != compatible_masters_.end()) {
-    const auto& bits_to_masters = it->second;
-    if (bits_to_masters.count(total_flops) > 0) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-bool 
-gpl::AggloCluster::checkPlacementDensityConstraint(
-    const FlopCluster& c1,
-    odb::dbMaster* master1, 
-    const FlopCluster& c2,
-    odb::dbMaster* master2, 
-    const Point& new_pos,
-    odb::dbMaster* new_master)     
-{
-  if (!master1 || !master2 || !new_master) {
-    if (verbose_) {
-      std::cout << "[checkPlacementDensityConstraint] Null master passed. Skipping density check." << std::endl;
-    }
-    return false;
-  }
-
-  Point c1_pos(std::lround(c1.curr_pt_.x), std::lround(c1.curr_pt_.y));
-  Point c2_pos(std::lround(c2.curr_pt_.x), std::lround(c2.curr_pt_.y));
-
-  virtual_bin_grid_.removeInst(master1, c1_pos);
-  virtual_bin_grid_.removeInst(master2, c2_pos);
-  virtual_bin_grid_.addInst(new_master, new_pos);
-
-  bool has_overflow = virtual_bin_grid_.checkOverflow();
-
-  if (has_overflow) {
-    virtual_bin_grid_.removeInst(new_master, new_pos);
-    virtual_bin_grid_.addInst(master2, c2_pos);
-    virtual_bin_grid_.addInst(master1, c1_pos);
-
-    return false;
-  }
-  return true; 
-}
-
-std::set<int>
-AggloCluster::distributeSlack(const FlopCluster& cluster)
-{
-  throw std::logic_error("distributeSlack not implemented");
-  // std::set<int> affected_flop_units;
-
-  // for (int flop_idx : cluster.flops_) {
-  //   const FlopUnit& flop = flop_units_[flop_idx];
-
-  //   // Calculate used slacks for each pin of the flop 
-  //   std::unordered_map<odb::dbITerm*, std::pair<int, sta::Slack>> used_slacks = calcUsedSlacks(flop);
-
-  //   for (const auto& [pin, used_slack_pair] : used_slacks) {
-  //     const auto& [path_idx, used_slack] = used_slack_pair;
-  //     const TimingPath& path = timing_paths_[path_idx];
-
-  //     // Find the flop on the other side of the timing path
-  //     int other_flop_idx = (path.start_flop_idx_ == flop_idx)
-  //                              ? path.end_flop_idx_
-  //                              : path.start_flop_idx_;
-
-  //     // If the other flop is also in the same cluster, no need to distribute slack
-  //     if (flop_units_[other_flop_idx].cluster_idx_ == cluster.id_) {
-  //       continue;
-  //     }
-
-  //     FlopUnit& other_flop = flop_units_[other_flop_idx];
-  //     affected_flop_units.insert(other_flop_idx);
-
-  //     // Find the connected pin on the other flop for this path
-  //     odb::dbITerm* other_pin = getConnectedPinOnPath(path.path_, other_flop);
-  //     if (other_pin == nullptr
-  //         || other_flop.pin_budgets_.find(other_pin)
-  //                == other_flop.pin_budgets_.end()) {
-  //       continue;
-  //     }
-
-  //     auto& other_budgets = other_flop.pin_budgets_.at(other_pin);
-  //     for (auto& budget_pair : other_budgets) {
-  //       if (budget_pair.first == path_idx) {
-  //         // Find the original budget allocated to this path on the current flop
-  //         sta::Slack original_budget = 0.0; 
-  //         const auto& budgets = flop.pin_budgets_.at(pin);
-  //         for (const auto& orig_budget_pair : budgets) {
-  //           if (orig_budget_pair.first == path_idx) {
-  //             original_budget = orig_budget_pair.second;
-  //             break;
-  //           }
-  //         }
-
-  //         // Update the budget on the other flop by adding the slack delta
-  //         sta::Slack slack_delta = original_budget - used_slack;
-  //         budget_pair.second += slack_delta;
-  //         break;
-  //       }
-  //     }
-
-  //     // Sort the budgets for the updated pin
-  //     std::sort(other_budgets.begin(),
-  //               other_budgets.end(),
-  //               [](const auto& a, const auto& b) { return a.second < b.second; });
-  //   }
-  // }
-  // return affected_flop_units;
-}
-
-std::set<std::variant<odb::dbITerm*, odb::dbBTerm*>>
-AggloCluster::getConnectedPins(const FlopCluster& cluster) const
-{
-  std::set<std::variant<odb::dbITerm*, odb::dbBTerm*>> connected_pins;
-  
-  std::set<odb::dbInst*> cluster_insts;
-  for (int flop_idx : cluster.flops_) {
-    cluster_insts.insert(flop_units_[flop_idx].inst_);
-  }
-  
-  for (int flop_idx : cluster.flops_) {
-    const FlopUnit& flop = flop_units_[flop_idx];
-    for (odb::dbITerm* iterm : flop.inst_->getITerms()) {
-      odb::dbNet* net = iterm->getNet();
-      if (net == nullptr
-          || (net->getSigType() != odb::dbSigType::SIGNAL
-              && net->getSigType() != odb::dbSigType::CLOCK)) {
-        continue;
-      }
-      for (odb::dbITerm* net_iterm : net->getITerms()) {
-        if (cluster_insts.find(net_iterm->getInst()) == cluster_insts.end()) {
-          connected_pins.insert(net_iterm);
-        }
-      }
-      for (odb::dbBTerm* net_bterm : net->getBTerms()) {
-        connected_pins.insert(net_bterm);
-      }
-    }
-  }
-  return connected_pins;
 }
 
 Box
@@ -3368,176 +4098,1313 @@ AggloCluster::getFeasibleRegionIntersection(const FlopCluster& c1,
   return intersection_box;
 }
 
-std::vector<FlopClusterEntry>
-AggloCluster::getIntersectedCluster(const FlopCluster& cluster) const
+Point 
+AggloCluster::project(const Box& hpwl_box, const Box& feasible_box) const
 {
-  std::vector<FlopClusterEntry> intersecting_clusters;
+  // Calculate center of HPWL box in XY coordinates
+  const Point& min_xy = hpwl_box.min_corner();
+  const Point& max_xy = hpwl_box.max_corner();
 
-  if (boost::geometry::is_empty(cluster.feasible_region_)) {
-    return intersecting_clusters;
+  int target_x = (min_xy.get<0>() + max_xy.get<0>()) / 2;
+  int target_y = (min_xy.get<1>() + max_xy.get<1>()) / 2;
+  Point target_xy(target_x, target_y);
+
+  // Transform to UV coordinates
+  Point target_uv = transformCoords(target_xy);
+
+  // Clamp to feasible region bounds
+  const Point& min_uv = feasible_box.min_corner();
+  const Point& max_uv = feasible_box.max_corner();
+
+  int u_final = std::clamp(target_uv.get<0>(), min_uv.get<0>(), max_uv.get<0>());
+  int v_final = std::clamp(target_uv.get<1>(), min_uv.get<1>(), max_uv.get<1>());
+
+  Point final_uv(u_final, v_final);
+
+  // Transform back to XY coordinates
+  Point final_xy = inverseTransformCoords(final_uv);
+
+  return final_xy;
+}
+
+std::vector<gpl::Point> 
+gpl::AggloCluster::generateUniformSamples(const Box& box, int p) const
+{
+  std::vector<Point> samples;
+  if (p <= 0) {
+    return samples;
   }
 
-  feasible_regions_.query(bgi::intersects(cluster.feasible_region_),
-                          std::back_inserter(intersecting_clusters));
+  int u_min = box.min_corner().get<0>();
+  int u_max = box.max_corner().get<0>();
+  int v_min = box.min_corner().get<1>();
+  int v_max = box.max_corner().get<1>();
 
-  return intersecting_clusters;
+  // Special case: single sample at center
+  if (p == 1) {
+    int u = (u_min + u_max) / 2;
+    int v = (v_min + v_max) / 2;
+    Point center_p_uv(u, v);
+    Point center_p_xy = inverseTransformCoords(center_p_uv);
+    samples.push_back(center_p_xy);
+    return samples;
+  }
+
+  // Multiple samples: create grid including boundaries
+  int num_steps = static_cast<int>(std::ceil(std::sqrt(p)));
+  
+  double u_step = (u_max == u_min) ? 0.0 : static_cast<double>(u_max - u_min) / (num_steps - 1.0);
+  double v_step = (v_max == v_min) ? 0.0 : static_cast<double>(v_max - v_min) / (num_steps - 1.0);
+
+  for (int i = 0; i < num_steps; ++i) {
+    for (int j = 0; j < num_steps; ++j) {
+      
+      // Ensure exact boundaries at last step
+      int u = (i == num_steps - 1) ? u_max : (u_min + static_cast<int>(std::round(i * u_step)));
+      int v = (j == num_steps - 1) ? v_max : (v_min + static_cast<int>(std::round(j * v_step)));
+      
+      Point sample_p_uv(u, v); 
+      Point sample_p_xy = inverseTransformCoords(sample_p_uv);
+      samples.push_back(sample_p_xy);
+    }
+  }
+  
+  return samples;
+}
+
+bool 
+gpl::AggloCluster::checkPlacementDensityConstraint(
+    const FlopCluster& c1,
+    odb::dbMaster* master1, 
+    const FlopCluster& c2,
+    odb::dbMaster* master2, 
+    const Point& new_pos,
+    odb::dbMaster* new_master)     
+{
+  if (!master1 || !master2 || !new_master) {
+    if (verbose_) {
+      std::cout << "[checkPlacementDensityConstraint] Null master. Skipping check." << std::endl;
+    }
+    return false;
+  }
+
+  // Convert cluster positions to integer points
+  Point c1_pos(std::lround(c1.curr_pt_.x), std::lround(c1.curr_pt_.y));
+  Point c2_pos(std::lround(c2.curr_pt_.x), std::lround(c2.curr_pt_.y));
+
+  // Remove old clusters and add merged cluster
+  virtual_bin_grid_.removeInst(master1, c1_pos);
+  virtual_bin_grid_.removeInst(master2, c2_pos);
+  virtual_bin_grid_.addInst(new_master, new_pos);
+
+  bool has_overflow = virtual_bin_grid_.checkOverflow();
+
+  // Rollback if overflow detected
+  if (has_overflow) {
+    virtual_bin_grid_.removeInst(new_master, new_pos);
+    virtual_bin_grid_.addInst(master2, c2_pos);
+    virtual_bin_grid_.addInst(master1, c1_pos);
+    return false;
+  }
+  
+  return true; 
+}
+
+double 
+AggloCluster::calcMergeHPWLGain(const FlopCluster& c1, 
+                                const FlopCluster& c2, 
+                                const FloatPoint& merge_position,
+                                bool verbose) const
+{
+  if (verbose) {
+    std::cout << "      [calcMergeHPWLGain] Calculating HPWL gain for merge" << std::endl;
+    std::cout << "        c1 current position: (" 
+              << static_cast<int>(c1.curr_pt_.x) << ", "
+              << static_cast<int>(c1.curr_pt_.y) << "), flops: " << c1.flops_.size() << std::endl;
+    std::cout << "        c2 current position: (" 
+              << static_cast<int>(c2.curr_pt_.x) << ", "
+              << static_cast<int>(c2.curr_pt_.y) << "), flops: " << c2.flops_.size() << std::endl;
+    std::cout << "        Merge position: (" 
+              << static_cast<int>(merge_position.x) << ", "
+              << static_cast<int>(merge_position.y) << ")" << std::endl;
+  }
+  
+  // Collect all instances in both clusters
+  std::set<odb::dbInst*> c1_insts, c2_insts;
+  for (int flop_idx : c1.flops_) {
+    c1_insts.insert(flop_units_[flop_idx].inst_);
+  }
+  for (int flop_idx : c2.flops_) {
+    c2_insts.insert(flop_units_[flop_idx].inst_);
+  }
+  
+  // Collect all unique nets connected to either cluster
+  std::set<odb::dbNet*> all_nets;
+  for (int flop_idx : c1.flops_) {
+    for (odb::dbITerm* iterm : flop_units_[flop_idx].inst_->getITerms()) {
+      odb::dbNet* net = iterm->getNet();
+      if (net && (net->getSigType() == odb::dbSigType::SIGNAL || 
+                  net->getSigType() == odb::dbSigType::CLOCK)) {
+        all_nets.insert(net);
+      }
+    }
+  }
+  for (int flop_idx : c2.flops_) {
+    for (odb::dbITerm* iterm : flop_units_[flop_idx].inst_->getITerms()) {
+      odb::dbNet* net = iterm->getNet();
+      if (net && (net->getSigType() == odb::dbSigType::SIGNAL || 
+                  net->getSigType() == odb::dbSigType::CLOCK)) {
+        all_nets.insert(net);
+      }
+    }
+  }
+  
+  if (verbose) {
+    std::cout << "        Total unique nets: " << all_nets.size() << std::endl;
+  }
+  
+  double original_hpwl = 0.0;
+  double merged_hpwl = 0.0;
+  int net_count = 0;
+  
+  int merge_x = static_cast<int>(merge_position.x);
+  int merge_y = static_cast<int>(merge_position.y);
+  int c1_x = static_cast<int>(c1.curr_pt_.x);
+  int c1_y = static_cast<int>(c1.curr_pt_.y);
+  int c2_x = static_cast<int>(c2.curr_pt_.x);
+  int c2_y = static_cast<int>(c2.curr_pt_.y);
+  
+  // Process each net
+  for (odb::dbNet* net : all_nets) {
+    // Check connections to each cluster
+    bool has_c1_connection = false;
+    bool has_c2_connection = false;
+    
+    // Collect external pin coordinates (not in c1 or c2)
+    std::vector<std::pair<int, int>> external_pins;
+    
+    for (odb::dbITerm* net_iterm : net->getITerms()) {
+      odb::dbInst* inst = net_iterm->getInst();
+      
+      if (c1_insts.find(inst) != c1_insts.end()) {
+        has_c1_connection = true;
+      } else if (c2_insts.find(inst) != c2_insts.end()) {
+        has_c2_connection = true;
+      } else {
+        FloatPoint pin_coord = getPinCoordinate(net_iterm);
+        external_pins.emplace_back(static_cast<int>(pin_coord.x), 
+                                   static_cast<int>(pin_coord.y));
+      }
+    }
+    
+    // Include top-level ports (BTerms)
+    for (odb::dbBTerm* net_bterm : net->getBTerms()) {
+      FloatPoint pin_coord = getPinCoordinate(net_bterm);
+      external_pins.emplace_back(static_cast<int>(pin_coord.x), 
+                                 static_cast<int>(pin_coord.y));
+    }
+    
+    // Calculate original HPWL (before merge)
+    double net_original_hpwl = 0.0;
+    int min_x = std::numeric_limits<int>::max();
+    int max_x = std::numeric_limits<int>::min();
+    int min_y = std::numeric_limits<int>::max();
+    int max_y = std::numeric_limits<int>::min();
+    
+    for (const auto& [x, y] : external_pins) {
+      min_x = std::min(min_x, x);
+      max_x = std::max(max_x, x);
+      min_y = std::min(min_y, y);
+      max_y = std::max(max_y, y);
+    }
+    
+    if (has_c1_connection) {
+      min_x = std::min(min_x, c1_x);
+      max_x = std::max(max_x, c1_x);
+      min_y = std::min(min_y, c1_y);
+      max_y = std::max(max_y, c1_y);
+    }
+    
+    if (has_c2_connection) {
+      min_x = std::min(min_x, c2_x);
+      max_x = std::max(max_x, c2_x);
+      min_y = std::min(min_y, c2_y);
+      max_y = std::max(max_y, c2_y);
+    }
+    
+    if (max_x >= min_x && max_y >= min_y) {
+      net_original_hpwl = (max_x - min_x) + (max_y - min_y);
+      original_hpwl += net_original_hpwl;
+    }
+    
+    // Calculate merged HPWL (after merge)
+    double net_merged_hpwl = 0.0;
+    min_x = std::numeric_limits<int>::max();
+    max_x = std::numeric_limits<int>::min();
+    min_y = std::numeric_limits<int>::max();
+    max_y = std::numeric_limits<int>::min();
+    
+    for (const auto& [x, y] : external_pins) {
+      min_x = std::min(min_x, x);
+      max_x = std::max(max_x, x);
+      min_y = std::min(min_y, y);
+      max_y = std::max(max_y, y);
+    }
+    
+    // Both clusters now at merge position
+    if (has_c1_connection || has_c2_connection) {
+      min_x = std::min(min_x, merge_x);
+      max_x = std::max(max_x, merge_x);
+      min_y = std::min(min_y, merge_y);
+      max_y = std::max(max_y, merge_y);
+    }
+    
+    if (max_x >= min_x && max_y >= min_y) {
+      net_merged_hpwl = (max_x - min_x) + (max_y - min_y);
+      merged_hpwl += net_merged_hpwl;
+    }
+    
+    net_count++;
+    if (verbose && net_count <= 3) {
+      std::cout << "        Net #" << net_count << " '" << net->getName() << "':" << std::endl;
+      std::cout << "          c1 connected: " << (has_c1_connection ? "YES" : "NO") << std::endl;
+      std::cout << "          c2 connected: " << (has_c2_connection ? "YES" : "NO") << std::endl;
+      std::cout << "          External pins: " << external_pins.size() << std::endl;
+      std::cout << "          Original HPWL: " << net_original_hpwl << " DBU" << std::endl;
+      std::cout << "          Merged HPWL: " << net_merged_hpwl << " DBU" << std::endl;
+      std::cout << "          Net gain: " << (net_merged_hpwl - net_original_hpwl) << " DBU" << std::endl;
+    }
+  }
+  
+  double gain = merged_hpwl - original_hpwl;
+  
+  if (verbose) {
+    std::cout << "        Nets processed: " << net_count << std::endl;
+    std::cout << "        Original HPWL (c1, c2 separate): " << original_hpwl << " DBU" << std::endl;
+    std::cout << "        Merged HPWL (at merge position): " << merged_hpwl << " DBU" << std::endl;
+    std::cout << "        HPWL gain: " << gain << (gain < 0 ? " (improvement)" : " (degradation)") << std::endl;
+  }
+  
+  return gain;
+}
+
+// -----------------------------------------------------------------------------
+// [Level 4] Lower-level helpers
+// -----------------------------------------------------------------------------
+
+std::set<std::variant<odb::dbITerm*, odb::dbBTerm*>>
+AggloCluster::getConnectedPins(const FlopCluster& cluster) const
+{
+  std::set<std::variant<odb::dbITerm*, odb::dbBTerm*>> connected_pins;
+  
+  // Build set of instances in cluster for fast lookup
+  std::set<odb::dbInst*> cluster_insts;
+  for (int flop_idx : cluster.flops_) {
+    cluster_insts.insert(flop_units_[flop_idx].inst_);
+  }
+  
+  // Collect external pins connected to cluster
+  for (int flop_idx : cluster.flops_) {
+    const FlopUnit& flop = flop_units_[flop_idx];
+    
+    for (odb::dbITerm* iterm : flop.inst_->getITerms()) {
+      odb::dbNet* net = iterm->getNet();
+      
+      // Skip invalid or non-signal/clock nets
+      if (net == nullptr
+          || (net->getSigType() != odb::dbSigType::SIGNAL
+              && net->getSigType() != odb::dbSigType::CLOCK)) {
+        continue;
+      }
+      
+      // Add external instance terminals
+      for (odb::dbITerm* net_iterm : net->getITerms()) {
+        if (cluster_insts.find(net_iterm->getInst()) == cluster_insts.end()) {
+          connected_pins.insert(net_iterm);
+        }
+      }
+      
+      // Add top-level block terminals
+      for (odb::dbBTerm* net_bterm : net->getBTerms()) {
+        connected_pins.insert(net_bterm);
+      }
+    }
+  }
+  
+  return connected_pins;
+}
+
+FloatPoint 
+AggloCluster::getPinCoordinate(const std::variant<odb::dbITerm*, odb::dbBTerm*>& pin_variant) const
+{
+  int x = 0, y = 0;
+
+  if (std::holds_alternative<odb::dbITerm*>(pin_variant)) {
+    odb::dbITerm* iterm = std::get<odb::dbITerm*>(pin_variant);
+    
+    if (!iterm->getAvgXY(&x, &y)) {
+      std::cerr << "[FATAL] Failed to get coordinates for ITerm: " 
+                << iterm->getName() << std::endl;
+      std::exit(1);
+    }
+    return FloatPoint(static_cast<float>(x), static_cast<float>(y));
+  } 
+  
+  odb::dbBTerm* bterm = std::get<odb::dbBTerm*>(pin_variant);
+  odb::Rect bbox = bterm->getBBox();
+  
+  if (bbox.isInverted()) {
+    std::cerr << "[FATAL] Invalid BBox for BTerm: " 
+              << bterm->getName() << std::endl;
+    std::exit(1);
+  }
+  
+  return FloatPoint(static_cast<float>(bbox.xCenter()),
+                    static_cast<float>(bbox.yCenter()));
+}
+
+//==============================================================================
+// Phase 10 Helper Functions: Agglomerative Clustering
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// [Level 1] Top-level: Execute merge operations and maintain graph
+//------------------------------------------------------------------------------
+
+int 
+AggloCluster::mergeClusters(const Edge& edge, bool verbose)
+{
+  const FlopCluster& c1 = flop_clusters_[edge.n1];
+  const FlopCluster& c2 = flop_clusters_[edge.n2];
+
+  if (verbose) {
+    std::cout << "\n      [mergeClusters] Merging Cluster[" << edge.n1 << "] + Cluster[" << edge.n2 << "]" << std::endl;
+    std::cout << "        C1 size: " << c1.flops_.size() << " flop(s), position: (" 
+              << c1.curr_pt_.x << ", " << c1.curr_pt_.y << ")" << std::endl;
+    std::cout << "        C2 size: " << c2.flops_.size() << " flop(s), position: (" 
+              << c2.curr_pt_.x << ", " << c2.curr_pt_.y << ")" << std::endl;
+    std::cout << "        New position: (" << edge.pos.x << ", " << edge.pos.y << ")" << std::endl;
+  }
+
+  // Step 1: Mark old clusters as invalid
+  flop_cluster_is_valid_[edge.n1] = false;
+  flop_cluster_is_valid_[edge.n2] = false;
+
+  if (verbose) {
+    std::cout << "        [Step 1] Marked old clusters as invalid" << std::endl;
+  }
+
+  // Step 2: Remove edges associated with old clusters
+  removeEdges(c1, verbose);
+  removeEdges(c2, verbose);
+
+  if (verbose) {
+    std::cout << "        [Step 2] Removed edges from old clusters" << std::endl;
+  }
+
+  // Step 3: Remove feasible regions of old clusters from R-Tree
+  feasible_regions_.remove(std::make_pair(c1.feasible_region_, edge.n1));
+  feasible_regions_.remove(std::make_pair(c2.feasible_region_, edge.n2));
+
+  if (verbose) {
+    std::cout << "        [Step 3] Removed feasible regions from R-Tree" << std::endl;
+  }
+
+  // Step 4: Create new merged cluster
+  const int new_cluster_idx = flop_clusters_.size();
+  flop_clusters_.emplace_back(new_cluster_idx, c1, c2, edge);
+  flop_cluster_is_valid_.push_back(true);
+  flop_cluster_no_further_merge_.push_back(false);
+  
+  FlopCluster& new_cluster = flop_clusters_.back();
+
+  if (verbose) {
+    std::cout << "        [Step 4] Created new cluster #" << new_cluster_idx << std::endl;
+    std::cout << "          New cluster size: " << new_cluster.flops_.size() << " flop(s)" << std::endl;
+    
+    const Box& fr = new_cluster.feasible_region_;
+    const bool fr_empty = boost::geometry::is_empty(fr);
+    if (fr_empty) {
+      std::cout << "          WARNING: Feasible region is EMPTY!" << std::endl;
+    } else {
+      std::cout << "          Feasible region: (" << fr.min_corner().get<0>() << ", " 
+                << fr.min_corner().get<1>() << ") -> (" << fr.max_corner().get<0>() << ", " 
+                << fr.max_corner().get<1>() << ")" << std::endl;
+    }
+  }
+
+  // Step 5: Update all flop units that belong to this new cluster
+  for (int flop_idx : new_cluster.flops_) {
+    flop_units_[flop_idx].cluster_idx_ = new_cluster_idx;
+    flop_units_[flop_idx].curr_pt_ = new_cluster.curr_pt_;
+  }
+
+  if (verbose) {
+    std::cout << "        [Step 5] Updated " << new_cluster.flops_.size() << " flop unit(s)" << std::endl;
+  }
+
+  // Step 6: Insert new cluster's feasible region into R-Tree
+  if (!boost::geometry::is_empty(new_cluster.feasible_region_)) {
+    feasible_regions_.insert(std::make_pair(new_cluster.feasible_region_, new_cluster_idx));
+    
+    if (verbose) {
+      std::cout << "        [Step 6] Inserted feasible region into R-Tree" << std::endl;
+      
+      // Verify insertion by querying the R-Tree
+      std::vector<FlopClusterEntry> query_result;
+      feasible_regions_.query(
+          boost::geometry::index::intersects(new_cluster.feasible_region_),
+          std::back_inserter(query_result)
+      );
+      
+      // Check if our newly inserted cluster appears in the query
+      bool found = false;
+      int self_count = 0;
+      for (const auto& [box, idx] : query_result) {
+        if (idx == new_cluster_idx) {
+          found = true;
+          self_count++;
+        }
+      }
+      
+      if (found) {
+        std::cout << "          ✓ Verification: Found in R-Tree query" << std::endl;
+        if (self_count > 1) {
+          std::cout << "          ⚠ WARNING: Found " << self_count 
+                    << " times (should be 1) - duplicate insertion!" << std::endl;
+        }
+      } else {
+        std::cout << "          ✗ ERROR: NOT found in R-Tree after insertion!" << std::endl;
+        std::cout << "          This is a critical bug - cluster won't be discoverable" << std::endl;
+      }
+      
+      // Show overlapping clusters
+      int overlap_count = query_result.size() - self_count;
+      std::cout << "          • Overlapping clusters: " << overlap_count << std::endl;
+      
+      if (overlap_count > 0 && overlap_count <= 5) {
+        std::cout << "          • Overlapping cluster IDs: ";
+        bool first = true;
+        for (const auto& [box, idx] : query_result) {
+          if (idx != new_cluster_idx) {
+            if (!first) std::cout << ", ";
+            std::cout << idx;
+            first = false;
+          }
+        }
+        std::cout << std::endl;
+      } else if (overlap_count > 5) {
+        std::cout << "          • (showing first 5 overlapping clusters)" << std::endl;
+        std::cout << "          • Overlapping cluster IDs: ";
+        int shown = 0;
+        for (const auto& [box, idx] : query_result) {
+          if (idx != new_cluster_idx && shown < 5) {
+            if (shown > 0) std::cout << ", ";
+            std::cout << idx;
+            shown++;
+          }
+        }
+        std::cout << " ... (+" << (overlap_count - 5) << " more)" << std::endl;
+      }
+    }
+  } else if (verbose) {
+    std::cout << "        [Step 6] Skipped R-Tree insertion (empty feasible region)" << std::endl;
+    std::cout << "          ⚠ WARNING: Empty feasible region means this cluster" << std::endl;
+    std::cout << "          won't be discoverable for future edge creation!" << std::endl;
+  }
+
+  return new_cluster_idx;
 }
 
 bool
-AggloCluster::isFurtherMergeable(const FlopCluster& cluster) const
+AggloCluster::isFurtherMergeable(const FlopCluster& cluster, bool verbose) const
 {
-  auto it = compatible_masters_.find(cluster.master_mask_);
+  // Check if compatible masters exist for this cluster's mask
+  const auto it = compatible_masters_.find(cluster.master_mask_);
   if (it == compatible_masters_.end()) {
+    if (verbose) {
+      std::cout << "    ✗ Mask not found in compatible_masters_" << std::endl;
+      std::cout << "      (This should not happen - possible bug)" << std::endl;
+    }
     return false;
   }
 
   const auto& bits_to_masters = it->second;
   if (bits_to_masters.empty()) {
+    if (verbose) {
+      std::cout << "    ✗ No masters available for this mask" << std::endl;
+    }
     return false;
   }
 
-  int max_bits = bits_to_masters.rbegin()->first;
+  // Get maximum bit-width available for this mask
+  const int max_bits = bits_to_masters.rbegin()->first;
+  const int current_size = static_cast<int>(cluster.flops_.size());
 
-  return cluster.flops_.size() < max_bits;
+  // Can merge further if current size is less than max available bits
+  const bool can_merge = current_size < max_bits;
+  
+  if (verbose) {
+    std::cout << "    ▸ isFurtherMergeable: " << (can_merge ? "✓ YES" : "✗ NO") << std::endl;
+    std::cout << "      Current size: " << current_size << " bit(s)" << std::endl;
+    std::cout << "      Maximum available: " << max_bits << " bit(s)" << std::endl;
+    
+    if (!can_merge && current_size == max_bits) {
+      std::cout << "      Reason: Already at maximum bit-width" << std::endl;
+    } else if (!can_merge) {
+      std::cout << "      Reason: Current size (" << current_size 
+                << ") >= max (" << max_bits << ")" << std::endl;
+    }
+    
+    // Show available bit-widths
+    std::cout << "      Available bit-widths: ";
+    bool first = true;
+    for (const auto& [bits, masters] : bits_to_masters) {
+      if (!first) std::cout << ", ";
+      std::cout << bits;
+      first = false;
+    }
+    std::cout << std::endl;
+  }
+  
+  return can_merge;
 }  
 
-int 
-AggloCluster::mergeClusters(const Edge& edge)
+std::set<int>
+AggloCluster::distributeSlack(const FlopCluster& cluster, bool verbose)
 {
-  const FlopCluster& c1 = flop_clusters_[edge.n1];
-  const FlopCluster& c2 = flop_clusters_[edge.n2];
-
-  // Marking old clusters as invalid
-  flop_cluster_is_valid_[edge.n1] = false;
-  flop_cluster_is_valid_[edge.n2] = false;
-
-  // Remove edges associated with old clusters
-  removeEdges(c1);
-  removeEdges(c2);
-
-  // Remove feasible regions of old clusters from R-Tree
-  feasible_regions_.remove(std::make_pair(c1.feasible_region_, edge.n1));
-  feasible_regions_.remove(std::make_pair(c2.feasible_region_, edge.n2));
-
-  // Create new cluster by merging c1 and c2
-  int n_new_idx = flop_clusters_.size();
-  flop_clusters_.emplace_back(n_new_idx, c1, c2, edge);
-  flop_cluster_is_valid_.push_back(true);
-  flop_cluster_no_further_merge_.push_back(false);
-  FlopCluster& n_new = flop_clusters_.back();
-
-  // Update FlopUnit's info
-  for (int flop_idx : n_new.flops_) {
-    flop_units_[flop_idx].cluster_idx_ = n_new_idx;
-    flop_units_[flop_idx].curr_pt_ = n_new.curr_pt_;
+  if (verbose) {
+    std::cout << "        [distributeSlack] Processing cluster #" << cluster.id_ 
+              << " with " << cluster.flops_.size() << " flop(s)" << std::endl;
   }
 
-  // Insert feasible region of new cluster into R-Tree
-  if (!boost::geometry::is_empty(n_new.feasible_region_)) {
-    feasible_regions_.insert(std::make_pair(n_new.feasible_region_, n_new_idx));
+  std::set<int> affected_flop_units;
+  int total_paths_processed = 0;
+  int internal_paths_skipped = 0;
+  int slack_redistributed_count = 0;
+  int detailed_outputs = 0;
+  constexpr int MAX_DETAILED_OUTPUTS = 5;  // Show first 5 redistributions in detail
+
+  // Process each flop in the cluster
+  for (int flop_idx : cluster.flops_) {
+    const FlopUnit& flop = flop_units_[flop_idx];
+    
+    if (verbose && detailed_outputs < MAX_DETAILED_OUTPUTS) {
+      std::cout << "          ▸ Processing flop #" << flop_idx 
+                << " (inst: " << flop.inst_->getName() << ")" << std::endl;
+      std::cout << "            Original position: (" << flop.orig_pt_.x << ", " << flop.orig_pt_.y << ")" << std::endl;
+      std::cout << "            Current position: (" << flop.curr_pt_.x << ", " << flop.curr_pt_.y << ")" << std::endl;
+      
+      const float dx = std::abs(flop.curr_pt_.x - flop.orig_pt_.x);
+      const float dy = std::abs(flop.curr_pt_.y - flop.orig_pt_.y);
+      const float manhattan_distance = dx + dy;
+      std::cout << "            Manhattan distance: " << manhattan_distance << " DBU" << std::endl;
+    }
+
+    // Calculate used slacks for each pin of this flop
+    const auto used_slacks = calcUsedSlacks(flop, verbose && detailed_outputs < MAX_DETAILED_OUTPUTS);
+
+    // Distribute slack to connected flops outside this cluster
+    for (const auto& [pin, used_slack_list] : used_slacks) {
+      for (const auto& [path_idx, used_slack] : used_slack_list) {
+        total_paths_processed++;
+        const TimingPath& path = timing_paths_[path_idx];
+
+        // Identify the flop on the other end of this timing path
+        const int other_flop_idx = (path.start_flop_idx_ == flop_idx) 
+                                     ? path.end_flop_idx_ 
+                                     : path.start_flop_idx_;
+
+        // Skip if the other flop is also in the same cluster (internal path)
+        if (flop_units_[other_flop_idx].cluster_idx_ == cluster.id_) {
+          internal_paths_skipped++;
+          continue;
+        }
+
+        FlopUnit& other_flop = flop_units_[other_flop_idx];
+        affected_flop_units.insert(other_flop_idx);
+
+        // Get the corresponding pin on the other flop
+        odb::dbITerm* other_pin = (path.start_flop_idx_ == flop_idx) 
+                                    ? path.end_pin_ 
+                                    : path.start_pin_;
+        
+        if (!other_pin || other_flop.pin_budgets_.find(other_pin) == other_flop.pin_budgets_.end()) {
+          continue;
+        }
+
+        // Find the original slack budget for this path on current flop
+        sta::Slack original_budget = 0.0;
+        const auto& current_budgets = flop.pin_budgets_.at(pin);
+        for (const auto& [budget_path_idx, budget_slack] : current_budgets) {
+          if (budget_path_idx == path_idx) {
+            original_budget = budget_slack;
+            break;
+          }
+        }
+
+        // Update the slack budget on the other flop
+        auto& other_budgets = other_flop.pin_budgets_.at(other_pin);
+        sta::Slack old_other_budget = 0.0;
+        sta::Slack new_other_budget = 0.0;
+        
+        for (auto& [budget_path_idx, budget_slack] : other_budgets) {
+          if (budget_path_idx == path_idx) {
+            old_other_budget = budget_slack;
+            
+            // Redistribute the unused slack to the other flop
+            const sta::Slack slack_delta = original_budget - used_slack;
+            budget_slack += slack_delta;
+            new_other_budget = budget_slack;
+            
+            if (verbose && detailed_outputs < MAX_DETAILED_OUTPUTS) {
+              std::cout << "            ━━ Slack Redistribution ━━" << std::endl;
+              std::cout << "               Path #" << path_idx << ": Flop[" << flop_idx << "] → Flop[" << other_flop_idx << "]" << std::endl;
+              std::cout << "               Pin: " << pin->getMTerm()->getName() << " → " << other_pin->getMTerm()->getName() << std::endl;
+              std::cout << "               Original slack budget (current flop): " << std::fixed << std::setprecision(12) << original_budget << std::endl;
+              std::cout << "               Used slack (after movement): " << std::fixed << std::setprecision(12) << used_slack << std::endl;
+              std::cout << "               Unused slack (to redistribute): " << std::fixed << std::setprecision(12) << slack_delta << std::endl;
+              std::cout << "               Other flop slack: " << std::fixed << std::setprecision(12) << old_other_budget << " → " << new_other_budget << std::endl;
+              
+              if (slack_delta > 0) {
+                std::cout << "               ✓ Positive redistribution (slack increased)" << std::endl;
+              } else if (slack_delta < 0) {
+                std::cout << "               ⚠ Negative redistribution (slack decreased)" << std::endl;
+              } else {
+                std::cout << "               ○ No change (exact usage)" << std::endl;
+              }
+              detailed_outputs++;
+            }
+            
+            slack_redistributed_count++;
+            break;
+          }
+        }
+
+        // Re-sort budgets for the updated pin (ascending order of slack)
+        std::sort(other_budgets.begin(), other_budgets.end(),
+                  [](const auto& a, const auto& b) { 
+                    return a.second < b.second; 
+                  });
+      }
+    }
+  }
+  
+  if (verbose) {
+    std::cout << "          ━━━━━━━━━━━━━━━━━━━━━━━━━━━" << std::endl;
+    std::cout << "          Total paths processed: " << total_paths_processed << std::endl;
+    std::cout << "          Internal paths skipped: " << internal_paths_skipped << std::endl;
+    std::cout << "          Slack redistributed: " << slack_redistributed_count << " time(s)" << std::endl;
+    std::cout << "          Affected flop units: " << affected_flop_units.size() << std::endl;
+    if (detailed_outputs >= MAX_DETAILED_OUTPUTS) {
+      std::cout << "          (Showing first " << MAX_DETAILED_OUTPUTS << " detailed redistributions)" << std::endl;
+    }
   }
 
-  return n_new_idx;
+  return affected_flop_units;
 }
 
 void 
-AggloCluster::removeEdges(const FlopCluster& cluster)
+AggloCluster::removeEdges(const FlopCluster& cluster, bool verbose)
 {
   const int cluster_idx = cluster.id_;
 
+  // Check if this cluster has any edges in adjacency list
   if (adj_list_.find(cluster_idx) == adj_list_.end()) {
+    if (verbose) {
+      std::cout << "          [removeEdges] Cluster #" << cluster_idx 
+                << ": No edges to remove" << std::endl;
+    }
     return;
   }
 
-  auto& edges_to_remove = adj_list_.at(cluster_idx);
+  const auto& edges_to_remove = adj_list_.at(cluster_idx);
+  const int edge_count = edges_to_remove.size();
   
+  if (verbose) {
+    std::cout << "          [removeEdges] Cluster #" << cluster_idx 
+              << ": Removing " << edge_count << " edge(s)" << std::endl;
+  }
+
+  // Remove each edge from priority queue and neighbor's adjacency list
   for (const Edge& edge : edges_to_remove) {
+    // Remove from global edge priority queue
     edge_pq_.erase(edge);
 
-    int neighbor_idx = (edge.n1 == cluster_idx) ? edge.n2 : edge.n1;
-
+    // Remove from neighbor's adjacency list
+    const int neighbor_idx = (edge.n1 == cluster_idx) ? edge.n2 : edge.n1;
     if (adj_list_.count(neighbor_idx)) {
       adj_list_.at(neighbor_idx).erase(edge);
     }
   }
 
+  // Remove this cluster's entry from adjacency list
   adj_list_.erase(cluster_idx);
 }
 
-void 
-AggloCluster::updateEdges(const FlopCluster& cluster)
-{
-  const int i = cluster.id_;
-
-  if (!flop_cluster_is_valid_[i] || flop_cluster_no_further_merge_[i]) {
-    return;
-  }
-
-  if (boost::geometry::is_empty(cluster.feasible_region_)) {
-    return;
-  }
-
-  std::vector<FlopClusterEntry> intersecting_entries = getIntersectedCluster(cluster);
-
-  for (const auto& entry : intersecting_entries) {
-    const int j = entry.second;
-
-    if (i >= j) {
-      continue;
-    }
-
-    if (!flop_cluster_is_valid_[j] || flop_cluster_no_further_merge_[j]) {
-      continue;
-    }
-
-    const FlopCluster& adj_cluster = flop_clusters_[j];
-
-    if (!checkCompatibility(cluster, adj_cluster)) {
-      continue;
-    }
-
-    PlacementCandidate pc = calcPlacementCandidate(cluster, adj_cluster);
-
-    if (!pc.is_valid_) {
-      continue;
-    }
-
-    Edge new_edge(i, j, pc.merge_gain_, pc.placement_pos_);
-
-    edge_pq_.insert(new_edge);
-    adj_list_[i].insert(new_edge);
-    adj_list_[j].insert(new_edge);
-  }
-}
 
 void 
-AggloCluster::updateFeasibleRegion(FlopCluster& cluster)
+AggloCluster::updateFeasibleRegion(FlopCluster& cluster, bool verbose)
 {
-  const Box old_fr = cluster.feasible_region_;
+  if (verbose) {
+    std::cout << "          [updateFeasibleRegion] Cluster #" << cluster.id_ 
+              << " with " << cluster.flops_.size() << " flop(s)" << std::endl;
+  }
 
+  const Box old_feasible_region = cluster.feasible_region_;
+  const bool old_was_empty = boost::geometry::is_empty(old_feasible_region);
+
+  // Calculate new feasible region as intersection of all member flops
   if (cluster.flops_.empty()) {
     cluster.feasible_region_ = Box();
+    
+    if (verbose) {
+      std::cout << "            WARNING: Cluster has no flops!" << std::endl;
+    }
   } else {
+    // Initialize with first flop's region
     auto it = cluster.flops_.begin();
     cluster.feasible_region_ = flop_units_[*it].feasible_region_;
+    
+    if (verbose) {
+      std::cout << "            Starting with flop #" << *it << "'s feasible region" << std::endl;
+    }
+
+    int intersection_count = 0;
+    
+    // Intersect with remaining flops' regions
     for (++it; it != cluster.flops_.end(); ++it) {
       const int flop_idx = *it;
-      const Box& flop_fr = flop_units_[flop_idx].feasible_region_;
-      boost::geometry::intersection(
-          cluster.feasible_region_, flop_fr, cluster.feasible_region_);
+      const Box& flop_feasible_region = flop_units_[flop_idx].feasible_region_;
+      
+      Box temp_result;
+      boost::geometry::intersection(cluster.feasible_region_, 
+                                    flop_feasible_region, 
+                                    temp_result);
+      
+      intersection_count++;
+      
+      cluster.feasible_region_ = temp_result;
+      
+      // Early exit if intersection becomes empty
       if (boost::geometry::is_empty(cluster.feasible_region_)) {
+        if (verbose) {
+          std::cout << "            WARNING: Feasible region became EMPTY after " 
+                    << intersection_count << " intersection(s)" << std::endl;
+        }
         break;
       }
     }
+    
+    if (verbose && !boost::geometry::is_empty(cluster.feasible_region_)) {
+      const Box& fr = cluster.feasible_region_;
+      std::cout << "            New feasible region: (" << fr.min_corner().get<0>() << ", " 
+                << fr.min_corner().get<1>() << ") -> (" << fr.max_corner().get<0>() << ", " 
+                << fr.max_corner().get<1>() << ")" << std::endl;
+      std::cout << "            Performed " << intersection_count << " intersection(s)" << std::endl;
+    }
   }
 
-  if (!boost::geometry::is_empty(old_fr)) {
-    feasible_regions_.remove(std::make_pair(old_fr, cluster.id_));
+  // Update R-Tree: remove old entry, insert new entry
+  if (!old_was_empty) {
+    feasible_regions_.remove(std::make_pair(old_feasible_region, cluster.id_));
+    
+    if (verbose) {
+      std::cout << "            Removed old feasible region from R-Tree" << std::endl;
+    }
   }
+  
   if (!boost::geometry::is_empty(cluster.feasible_region_)) {
     feasible_regions_.insert(std::make_pair(cluster.feasible_region_, cluster.id_));
+    
+    if (verbose) {
+      std::cout << "            Inserted new feasible region into R-Tree" << std::endl;
+    }
+  } else if (verbose) {
+    std::cout << "            Skipped R-Tree insertion (empty feasible region)" << std::endl;
   }
 }
+
+//==============================================================================
+// Reverse Engineering: calcUsedSlacks()
+//==============================================================================
+
+//------------------------------------------------------------------------------
+// [Level 1] Main Entry Point: Calculate used slacks based on flop movement
+//------------------------------------------------------------------------------
+
+std::unordered_map<odb::dbITerm*, std::vector<std::pair<int, sta::Slack>>>
+AggloCluster::calcUsedSlacks(const FlopUnit& flop, bool verbose)
+{
+  std::unordered_map<odb::dbITerm*, std::vector<std::pair<int, sta::Slack>>> used_slacks;
+  
+  if (verbose) {
+    std::cout << "\n[calcUsedSlacks] Analyzing flop: " << flop.inst_->getName() << std::endl;
+    std::cout << "  Original position: (" << flop.orig_pt_.x << ", " << flop.orig_pt_.y << ")" << std::endl;
+    std::cout << "  Current position:  (" << flop.curr_pt_.x << ", " << flop.curr_pt_.y << ")" << std::endl;
+    
+    const float dx = flop.curr_pt_.x - flop.orig_pt_.x;
+    const float dy = flop.curr_pt_.y - flop.orig_pt_.y;
+    const float manhattan_movement = std::abs(dx) + std::abs(dy);
+    
+    std::cout << "  Movement (Manhattan): " << manhattan_movement << " DBU" << std::endl;
+  }
+  
+  // Get wire parameters
+  const auto est = resizer_->getEstimateParasitics();
+  const double unit_c = est->wireSignalCapacitance(corner_);
+  const double unit_r = est->wireSignalResistance(corner_);
+  
+  // Classify pins
+  std::vector<odb::dbITerm*> d_pins, q_pins, qn_pins;
+  odb::dbITerm* clk_pin = nullptr;
+  
+  for (odb::dbITerm* iterm : flop.inst_->getITerms()) {
+    if (isDPin(iterm)) {
+      d_pins.push_back(iterm);
+    } else if (isQPin(iterm)) {
+      q_pins.push_back(iterm);
+    } else if (isQNPin(iterm)) {
+      qn_pins.push_back(iterm);
+    } else if (isClockPin(iterm)) {
+      clk_pin = iterm;
+    }
+  }
+  
+  if (!clk_pin) {
+    if (verbose) {
+      std::cout << "  [WARNING] No clock pin found - returning empty result" << std::endl;
+    }
+    return used_slacks;
+  }
+  
+  // Process output pins (Q/QN)
+  std::vector<odb::dbITerm*> output_pins;
+  output_pins.reserve(q_pins.size() + qn_pins.size());
+  output_pins.insert(output_pins.end(), q_pins.begin(), q_pins.end());
+  output_pins.insert(output_pins.end(), qn_pins.begin(), qn_pins.end());
+  
+  if (verbose && !output_pins.empty()) {
+    std::cout << "\n  Processing " << output_pins.size() << " output pin(s)..." << std::endl;
+  }
+  
+  for (odb::dbITerm* out_pin : output_pins) {
+    calcUsedSlacksFanOut(flop, out_pin, clk_pin->getMTerm(), 
+                         est, unit_r, unit_c, used_slacks, verbose);
+  }
+  
+  // Process input pins (D)
+  if (verbose && !d_pins.empty()) {
+    std::cout << "\n  Processing " << d_pins.size() << " input pin(s)..." << std::endl;
+  }
+  
+  for (odb::dbITerm* d_pin : d_pins) {
+    calcUsedSlacksFanIn(flop, d_pin, est, unit_r, unit_c, used_slacks, verbose);
+  }
+  
+  if (verbose) {
+    std::cout << "[calcUsedSlacks] Completed.\n" << std::endl;
+  }
+  
+  return used_slacks;
+}
+
+//------------------------------------------------------------------------------
+// [Level 2] FanOut Pin Processing (Q/QN pins)
+//------------------------------------------------------------------------------
+
+void
+AggloCluster::calcUsedSlacksFanOut(
+    const FlopUnit& flop,
+    odb::dbITerm* out_pin,
+    odb::dbMTerm* clk_pin_lib,
+    est::EstimateParasitics* est,
+    double unit_r,
+    double unit_c,
+    std::unordered_map<odb::dbITerm*, std::vector<std::pair<int, sta::Slack>>>& used_slacks,
+    bool verbose)
+{
+  if (verbose) {
+    std::cout << "\n  [FanOut Pin: " << out_pin->getMTerm()->getName() << "]" << std::endl;
+  }
+  
+  // Check if this pin has timing constraints
+  const auto budget_it = flop.pin_budgets_.find(out_pin);
+  if (budget_it == flop.pin_budgets_.end() || budget_it->second.empty()) {
+    if (verbose) {
+      std::cout << "    No timing constraints - skipping" << std::endl;
+    }
+    return;
+  }
+  
+  if (verbose) {
+    std::cout << "    Total timing paths: " << budget_it->second.size() << std::endl;
+  }
+  
+  // Validate net connection
+  odb::dbNet* fanout_net = out_pin->getNet();
+  if (!fanout_net) {
+    if (verbose) {
+      std::cout << "    Pin not connected to net - skipping" << std::endl;
+    }
+    return;
+  }
+  
+  // Extract cell delay characterization
+  const auto cap_delay = extractCapacitanceDelayPoints(
+      flop.inst_, 
+      clk_pin_lib->getName(), 
+      out_pin->getMTerm()->getName(), 
+      0);
+  
+  if (cap_delay.empty() || cap_delay.size() < 2) {
+    if (verbose) {
+      std::cout << "    Insufficient cap-delay data - skipping" << std::endl;
+    }
+    return;
+  }
+  
+  std::vector<float> coeffs;
+  coeffs.reserve(cap_delay.size() - 1);
+  for (size_t i = 1; i < cap_delay.size(); ++i) {
+    const float dy = cap_delay[i].second - cap_delay[i-1].second;
+    const float dx = cap_delay[i].first - cap_delay[i-1].first;
+    coeffs.push_back(dy / dx);
+  }
+  
+  // Build Steiner tree and compute parasitics
+  const sta::Pin* driver_pin_sta = network_->dbToSta(out_pin);
+  est::SteinerTree* driver_steiner_tree = est->makeSteinerTree(driver_pin_sta);
+  
+  const sta::Net* fanout_net_sta = network_->dbToSta(fanout_net);
+  float pin_capacitance = 0.0f, wire_capacitance_total = 0.0f;
+  const sta::MinMax* mm = sta::MinMax::max();
+  sta_->connectedCap(fanout_net_sta, corner_, mm, pin_capacitance, wire_capacitance_total);
+  const float total_net_capacitance = pin_capacitance + wire_capacitance_total;
+  
+  const auto top_steiner_point = driver_steiner_tree->top();
+  const auto driver_point = driver_steiner_tree->drvrPt();
+  const auto steiner_location = driver_steiner_tree->location(top_steiner_point);
+  const double l1 = dbuToMeters(driver_steiner_tree->distance(driver_point, top_steiner_point));
+  
+  const float wire_cap = l1 * unit_c;
+  const float wo_fst_stt_cap = total_net_capacitance - wire_cap;
+  
+  // Calculate actual MANHATTAN distance to Steiner point after movement
+  const int steiner_x = steiner_location.getX();
+  const int steiner_y = steiner_location.getY();
+  const float dx_new = std::abs(flop.curr_pt_.x - steiner_x);
+  const float dy_new = std::abs(flop.curr_pt_.y - steiner_y);
+  const float actual_dist_dbu = dx_new + dy_new;
+  const float actual_dist = dbuToMeters(actual_dist_dbu);
+  
+  if (verbose) {
+    std::cout << "    Steiner point: (" << steiner_x << ", " << steiner_y << ")" << std::endl;
+    std::cout << "    Original distance (l1): " << l1 << " m" << std::endl;
+    std::cout << "    Actual distance: " << actual_dist << " m" << std::endl;
+    std::cout << "    Distance change: " << (actual_dist - l1) << " m" << std::endl;
+  }
+  
+  // Calculate used slack for each timing path
+  std::vector<std::pair<int, sta::Slack>> pin_used_slacks;
+  pin_used_slacks.reserve(budget_it->second.size());
+  
+  for (const auto& [path_idx, slack_budget] : budget_it->second) {
+    // Find appropriate coefficient segment based on new capacitance
+    float coeff = coeffs.empty() ? 0.0f : coeffs.back();
+    const float new_cap = actual_dist * unit_c + wo_fst_stt_cap;
+    
+    for (size_t seg_idx = 0; seg_idx < coeffs.size(); ++seg_idx) {
+      if (new_cap >= cap_delay[seg_idx].first && 
+          new_cap <= cap_delay[seg_idx + 1].first) {
+        coeff = coeffs[seg_idx];
+        break;
+      }
+    }
+    
+    // Calculate delay increase components
+    // 1. RC delay (quadratic term)
+    const float rc_delay_increase = 
+        (actual_dist * actual_dist - l1 * l1) * unit_r * unit_c;
+    
+    // 2. Wire-load interaction delay (linear term)
+    const float wire_delay_increase = 
+        (actual_dist - l1) * wo_fst_stt_cap * unit_r;
+    
+    // 3. Cell delay increase due to capacitance change
+    const float cell_delay_increase = 
+        coeff * (actual_dist - l1) * unit_c;
+    
+    // Total delay increase = used slack
+    const float total_delay_increase = 
+        rc_delay_increase + wire_delay_increase + cell_delay_increase;
+    
+    const sta::Slack used_slack = total_delay_increase;
+    
+    pin_used_slacks.emplace_back(path_idx, used_slack);
+    
+    if (verbose) {
+      std::cout << "    Path " << path_idx << ":" << std::endl;
+      std::cout << "      Original slack budget: " << slack_budget << std::endl;
+      std::cout << "      RC delay increase: " << rc_delay_increase << std::endl;
+      std::cout << "      Wire delay increase: " << wire_delay_increase << std::endl;
+      std::cout << "      Cell delay increase: " << cell_delay_increase << std::endl;
+      std::cout << "      Total used slack: " << used_slack << std::endl;
+      std::cout << "      Remaining slack: " << (slack_budget - used_slack) << std::endl;
+    }
+  }
+  
+  used_slacks[out_pin] = std::move(pin_used_slacks);
+}
+
+//------------------------------------------------------------------------------
+// [Level 2] FanIn Pin Processing (D pins)
+//------------------------------------------------------------------------------
+
+void
+AggloCluster::calcUsedSlacksFanIn(
+    const FlopUnit& flop,
+    odb::dbITerm* d_pin,
+    est::EstimateParasitics* est,
+    double unit_r,
+    double unit_c,
+    std::unordered_map<odb::dbITerm*, std::vector<std::pair<int, sta::Slack>>>& used_slacks,
+    bool verbose)
+{
+  if (verbose) {
+    std::cout << "\n  [FanIn Pin: " << d_pin->getMTerm()->getName() << "]" << std::endl;
+  }
+  
+  // Check timing constraints
+  const auto budget_it = flop.pin_budgets_.find(d_pin);
+  if (budget_it == flop.pin_budgets_.end() || budget_it->second.empty()) {
+    if (verbose) {
+      std::cout << "    No timing constraints - skipping" << std::endl;
+    }
+    return;
+  }
+  
+  if (verbose) {
+    std::cout << "    Total timing paths: " << budget_it->second.size() << std::endl;
+  }
+  
+  // Validate net connection
+  odb::dbNet* fi_net = d_pin->getNet();
+  if (!fi_net) {
+    if (verbose) {
+      std::cout << "    Pin not connected to net - skipping" << std::endl;
+    }
+    return;
+  }
+  
+  // Get driver pin
+  odb::dbITerm* fi_net_drvr_pin = fi_net->get1stITerm();
+  if (!fi_net_drvr_pin) {
+    if (verbose) {
+      std::cout << "    No driver pin found - skipping" << std::endl;
+    }
+    return;
+  }
+  
+  // Calculate D pin capacitance
+  const sta::Pin* ipin_sta = network_->dbToSta(d_pin);
+  const float ipin_cap = getPinCapacitance(ipin_sta);
+  
+  // Extract cell delay characterization
+  odb::dbInst* fi_inst = fi_net_drvr_pin->getInst();
+  const auto slews = getInstanceInputSlews(fi_inst);
+  
+  std::vector<std::pair<float, float>> cap_delay;
+  float worst_delay = 0.0f;
+  
+  for (const auto& [iterm, slew] : slews) {
+    const auto pts = extractCapacitanceDelayPoints(
+        fi_inst,
+        iterm->getMTerm()->getName(),
+        fi_net_drvr_pin->getMTerm()->getName(),
+        slew);
+    
+    if (!pts.empty()) {
+      const float tail_second = pts.back().second;
+      if (tail_second >= worst_delay) {
+        worst_delay = tail_second;
+        cap_delay = pts;
+      }
+    }
+  }
+  
+  if (cap_delay.empty() || cap_delay.size() < 2) {
+    if (verbose) {
+      std::cout << "    Insufficient cap-delay data - skipping" << std::endl;
+    }
+    return;
+  }
+  
+  // Calculate coefficients
+  std::vector<float> coeffs;
+  coeffs.reserve(cap_delay.size() - 1);
+  for (size_t i = 1; i < cap_delay.size(); ++i) {
+    const float dy = cap_delay[i].second - cap_delay[i-1].second;
+    const float dx = cap_delay[i].first - cap_delay[i-1].first;
+    coeffs.push_back(dy / dx);
+  }
+  
+  // Build Steiner tree
+  const sta::Pin* fi_net_drvr_pin_sta = network_->dbToSta(fi_net_drvr_pin);
+  est::SteinerTree* fi_tree = est->makeSteinerTree(fi_net_drvr_pin_sta);
+  
+  float pin_cap = 0.0f, wire_cap = 0.0f;
+  const sta::MinMax* mm = sta::MinMax::max();
+  const sta::Net* fi_net_drvr_sta = network_->dbToSta(fi_net_drvr_pin->getNet());
+  sta_->connectedCap(fi_net_drvr_sta, corner_, mm, pin_cap, wire_cap);
+  const float total_cap = pin_cap + wire_cap;
+
+  const auto top_pt = fi_tree->top();
+  const auto top_loc = fi_tree->location(top_pt);
+  const int top_x = top_loc.getX();
+  const int top_y = top_loc.getY();
+  
+  // Find path in Steiner tree
+  const int branch_count = fi_tree->branchCount();
+  const int pin_count = fi_tree->pinCount();
+  
+  int target_pt = -1;
+  for (int i = 0; i < pin_count; i++) {
+    if (fi_tree->pin(i) == ipin_sta) {
+      target_pt = i;
+      break;
+    }
+  }
+  
+  if (target_pt == -1) {
+    if (verbose) {
+      std::cout << "    Target pin not found in Steiner tree - skipping" << std::endl;
+    }
+    return;
+  }
+  
+  const int drvr_pt = fi_tree->drvrPt();
+  std::vector<int> node_path;
+  
+  if (!findSteinerPathRecursive(fi_tree, drvr_pt, target_pt, node_path)) {
+    if (verbose) {
+      std::cout << "    Failed to find path in Steiner tree - skipping" << std::endl;
+    }
+    return;
+  }
+  
+  if (node_path.empty() || node_path.size() < 2) {
+    if (verbose) {
+      std::cout << "    Path too short - skipping" << std::endl;
+    }
+    return;
+  }
+  
+  // Calculate path segments
+  const size_t total_segments = node_path.size() - 1;
+  float pre_leaf_length_dbu = 0.0f;
+  float final_segment_length_dbu = 0.0f;
+  
+  for (size_t k = 0; k < total_segments; ++k) {
+    const int path_node1 = node_path[k];
+    const int path_node2 = node_path[k + 1];
+    
+    int current_wire_length = 0;
+    
+    for (int i = 0; i < branch_count; i++) {
+      odb::Point pt1, pt2;
+      int steiner_pt1, steiner_pt2, wire_length;
+      fi_tree->branch(i, pt1, steiner_pt1, pt2, steiner_pt2, wire_length);
+      
+      if ((steiner_pt1 == path_node1 && steiner_pt2 == path_node2) ||
+          (steiner_pt1 == path_node2 && steiner_pt2 == path_node1)) {
+        current_wire_length = wire_length;
+        break;
+      }
+    }
+    
+    if (k < total_segments - 1) {
+      pre_leaf_length_dbu += current_wire_length;
+    } else {
+      final_segment_length_dbu = current_wire_length;
+    }
+  }
+  
+  const float l1 = dbuToMeters(final_segment_length_dbu);
+  const float on_path_R_wo_last = unit_r * dbuToMeters(pre_leaf_length_dbu);
+  
+  // Calculate actual MANHATTAN distance to top Steiner point after movement
+  const float dx_new = std::abs(flop.curr_pt_.x - top_x);
+  const float dy_new = std::abs(flop.curr_pt_.y - top_y);
+  const float actual_dist_dbu = dx_new + dy_new;
+  const float actual_dist = dbuToMeters(actual_dist_dbu);
+  
+  if (verbose) {
+    std::cout << "    Top Steiner point: (" << top_x << ", " << top_y << ")" << std::endl;
+    std::cout << "    Original final segment (l1): " << l1 << " m" << std::endl;
+    std::cout << "    Actual distance: " << actual_dist << " m" << std::endl;
+    std::cout << "    Distance change: " << (actual_dist - l1) << " m" << std::endl;
+    std::cout << "    Pre-leaf resistance: " << on_path_R_wo_last << std::endl;
+  }
+  
+  // Calculate used slack for each timing path
+  std::vector<std::pair<int, sta::Slack>> pin_used_slacks;
+  pin_used_slacks.reserve(budget_it->second.size());
+  
+  for (const auto& [path_idx, slack_budget] : budget_it->second) {
+    // Find appropriate coefficient
+    float coeff = coeffs.empty() ? 0.0f : coeffs.back();
+    const float new_cap = total_cap + (actual_dist - l1) * unit_c;
+    
+    for (size_t seg_idx = 0; seg_idx < coeffs.size(); ++seg_idx) {
+      if (new_cap >= cap_delay[seg_idx].first && 
+          new_cap <= cap_delay[seg_idx + 1].first) {
+        coeff = coeffs[seg_idx];
+        break;
+      }
+    }
+    
+    // Calculate delay increase components
+    // 1. RC delay (quadratic term)
+    const float rc_delay_increase = 
+        (actual_dist * actual_dist - l1 * l1) * unit_r * unit_c;
+    
+    // 2. On-path resistance interaction with new wire capacitance
+    const float on_path_delay_increase = 
+        (actual_dist - l1) * on_path_R_wo_last * unit_c;
+    
+    // 3. Cell delay increase due to capacitance change
+    const float cell_delay_increase = 
+        coeff * (actual_dist - l1) * unit_c;
+    
+    // 4. Input pin capacitance interaction with new wire resistance
+    const float ipin_delay_increase = 
+        (actual_dist - l1) * unit_r * ipin_cap;
+    
+    // Total delay increase = used slack
+    const float total_delay_increase = 
+        rc_delay_increase + on_path_delay_increase + 
+        cell_delay_increase + ipin_delay_increase;
+    
+    const sta::Slack used_slack = total_delay_increase;
+    
+    pin_used_slacks.emplace_back(path_idx, used_slack);
+    
+    if (verbose) {
+      std::cout << "    Path " << path_idx << ":" << std::endl;
+      std::cout << "      Original slack budget: " << slack_budget << std::endl;
+      std::cout << "      RC delay increase: " << rc_delay_increase << std::endl;
+      std::cout << "      On-path delay increase: " << on_path_delay_increase << std::endl;
+      std::cout << "      Cell delay increase: " << cell_delay_increase << std::endl;
+      std::cout << "      Input pin delay increase: " << ipin_delay_increase << std::endl;
+      std::cout << "      Total used slack: " << used_slack << std::endl;
+      std::cout << "      Remaining slack: " << (slack_budget - used_slack) << std::endl;
+    }
+  }
+  
+  used_slacks[d_pin] = std::move(pin_used_slacks);
+}
+
 
 //==============================================================================
 // Unit Conversion Helper Functions
@@ -3577,70 +5444,9 @@ AggloCluster::inverseTransformCoords(const Point& p) const
   return Point((x_prime - y_prime) / 2, (x_prime + y_prime) / 2);
 }
 
-Point 
-AggloCluster::project(const Box& hpwl_box, const Box& feasible_box) const
-{
-    const Point& min_xy = hpwl_box.min_corner();
-    const Point& max_xy = hpwl_box.max_corner();
-
-    int target_x = (min_xy.get<0>() + max_xy.get<0>()) / 2;
-    int target_y = (min_xy.get<1>() + max_xy.get<1>()) / 2;
-    Point target_xy(target_x, target_y);
-
-    Point target_uv = transformCoords(target_xy);
-
-    const Point& min_uv = feasible_box.min_corner();
-    const Point& max_uv = feasible_box.max_corner();
-
-    int u_final = std::clamp(target_uv.get<0>(),  // u_target
-                             min_uv.get<0>(),     // u_min
-                             max_uv.get<0>());    // u_max
-
-    int v_final = std::clamp(target_uv.get<1>(),  // v_target
-                             min_uv.get<1>(),     // v_min
-                             max_uv.get<1>());    // v_max
-
-    Point final_uv(u_final, v_final);
-
-    Point final_xy = inverseTransformCoords(final_uv);
-
-    return final_xy;
-}
-
 //==============================================================================
 // Other Utility Helper Functions
 //==============================================================================
-
-FloatPoint 
-AggloCluster::getPinCoordinate(const std::variant<odb::dbITerm*, odb::dbBTerm*>& pin_variant) const
-{
-  int x = 0, y = 0;
-
-  if (std::holds_alternative<odb::dbITerm*>(pin_variant)) {
-    odb::dbITerm* iterm = std::get<odb::dbITerm*>(pin_variant);
-    
-    if (iterm->getAvgXY(&x, &y)) {
-      return FloatPoint(static_cast<float>(x), static_cast<float>(y));
-    } else {
-      // Critical error - cannot proceed without pin coordinates
-      std::cerr << "[FATAL] Failed to get average XY for ITerm: " << iterm->getName() << std::endl;
-      std::exit(1);
-    }
-  } else {
-    odb::dbBTerm* bterm = std::get<odb::dbBTerm*>(pin_variant);
-    
-    odb::Rect bbox = bterm->getBBox();
-    if (!bbox.isInverted()) {
-      return FloatPoint(static_cast<float>(bbox.xCenter()),
-                        static_cast<float>(bbox.yCenter()));
-    } else {
-      // Critical error - cannot proceed without pin coordinates
-      std::cerr << "[FATAL] Failed to get valid BBox for BTerm (is inverted): " 
-                << bterm->getName() << std::endl;
-      std::exit(1);
-    }
-  }
-}
 
 unsigned int 
 AggloCluster::roundDownToPowerOfTwo(unsigned int x)
@@ -3652,66 +5458,6 @@ AggloCluster::roundDownToPowerOfTwo(unsigned int x)
   x |= (x >> 8);
   x |= (x >> 16);
   return x ^ (x >> 1);
-}
-
-double // 이거 수정해야하네 
-AggloCluster::calcManhattanDistance(const FloatPoint& p1, const FloatPoint& p2) const
-{
-  double dx = std::abs(p1.x - p2.x);
-  double dy = std::abs(p1.y - p2.y);
-  return dx + dy;
-}
-
-std::vector<gpl::Point> 
-gpl::AggloCluster::generateUniformSamples(
-    const Box& box, // 입력 Box는 UV 공간의 Feasible Region
-    int p) const
-{
-  std::vector<Point> samples;
-  if (p <= 0) {
-    return samples;
-  }
-
-  int u_min = box.min_corner().get<0>();
-  int u_max = box.max_corner().get<0>();
-  int v_min = box.min_corner().get<1>();
-  int v_max = box.max_corner().get<1>();
-
-  // [수정] p=1인 경우 (Box의 중심점) 예외 처리
-  if (p == 1) {
-    int u = (u_min + u_max) / 2;
-    int v = (v_min + v_max) / 2;
-    Point center_p_uv(u, v);
-    Point center_p_xy = inverseTransformCoords(center_p_uv);
-    samples.push_back(center_p_xy);
-    return samples;
-  }
-
-  // --- p > 1 인 경우 (경계 포함 그리드) ---
-  
-  // p=2~4일 때 2, p=5~9일 때 3, ... (p > 1이므로 num_steps >= 2 보장)
-  int num_steps = static_cast<int>(std::ceil(std::sqrt(p)));
-  
-  // 경계를 포함하기 위해 (num_steps - 1)로 나눔
-  double u_step = (u_max == u_min) ? 0.0 : static_cast<double>(u_max - u_min) / (num_steps - 1.0);
-  double v_step = (v_max == v_min) ? 0.0 : static_cast<double>(v_max - v_min) / (num_steps - 1.0);
-
-  // 루프를 0부터 num_steps-1까지
-  for (int i = 0; i < num_steps; ++i) {
-    for (int j = 0; j < num_steps; ++j) {
-      
-      // std::round를 사용하고, 마지막 스텝은 max값으로 명시적 보장
-      int u = (i == num_steps - 1) ? u_max : (u_min + static_cast<int>(std::round(i * u_step)));
-      int v = (j == num_steps - 1) ? v_max : (v_min + static_cast<int>(std::round(j * v_step)));
-      
-      Point sample_p_uv(u, v); 
-
-      Point sample_p_xy = inverseTransformCoords(sample_p_uv);
-      samples.push_back(sample_p_xy);
-    }
-  }
-  
-  return samples; // XY 좌표 리스트 반환
 }
 
 // Implement

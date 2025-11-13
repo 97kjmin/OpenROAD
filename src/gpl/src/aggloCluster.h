@@ -354,6 +354,8 @@ public:
   std::vector<VirtualBin>& getBins() { return bins_; }
   std::pair<int, int> getMinMaxIdxX(const odb::Rect& box) const;
   std::pair<int, int> getMinMaxIdxY(const odb::Rect& box) const;
+  double getBinSizeX() const { return bin_size_x_; }
+  double getBinSizeY() const { return bin_size_y_; }
 
   // Modifiers
   void addInst(odb::dbMaster* master, const Point& center_pos);
@@ -632,7 +634,8 @@ class AggloCluster
                  float target_overflow,
                  int num_paths_per_endpoint,
                  int threads,
-                 bool verbose = false);
+                 float feasible_region_bin_multiplier = 3.0f,
+                 bool verbose = true);
     ~AggloCluster();
 
     // Main clustering flow
@@ -657,6 +660,7 @@ class AggloCluster
     int num_paths_per_endpoint_; // Number of timing paths to consider per flop endpoint
     float target_density_;
     float target_overflow_;
+    float feasible_region_bin_multiplier_; // Feasible region upper bound = bin_size * k
     bool verbose_;
 
     //========================================================================
@@ -798,39 +802,48 @@ class AggloCluster
     float getTerminalSlew(odb::dbITerm* terminal, sta::Graph* timing_graph, const sta::MinMax* min_max) const;
 
     // ╔═══════════════════════════════════════════════════════════════════╗
-    // ║ Phase 8: createFlopClusters()                                    ║
-    // ╚═══════════════════════════════════════════════════════════════════╝
-    // (No helper functions needed, uses initialized FlopUnits)
-
-    // ╔═══════════════════════════════════════════════════════════════════╗
     // ║ Phase 9: createCompatibilityGraph()                              ║
     // ╚═══════════════════════════════════════════════════════════════════╝
-    // [Level 1] Top-level: Check if two clusters can be merged
-    bool checkCompatibility(const FlopCluster& c1, const FlopCluster& c2) const;
-    PlacementCandidate calcPlacementCandidate(const FlopCluster& c1, const FlopCluster& c2);
-    double calcHPWLDiff(const FlopCluster& c1, const FlopCluster& c2, const FloatPoint& new_pos) const;
     
-    //   [Level 2] Helpers for placement analysis
+    // [Level 1] Top-level: Build/update compatibility graph edges
+    void updateEdges(const FlopCluster& cluster, bool verbose = false);
+    
+    // [Level 2] Main logic for edge creation
+    std::vector<FlopClusterEntry> getIntersectedCluster(const FlopCluster& cluster, bool verbose = false) const;
+    bool checkCompatibility(const FlopCluster& c1, const FlopCluster& c2, bool verbose = false) const;
+    PlacementCandidate calcPlacementCandidate(const FlopCluster& c1, const FlopCluster& c2, bool verbose = false);
+    
+    //   [Level 3] Helpers for placement candidate calculation
     Box calcMedianBox(const FlopCluster& c1, const FlopCluster& c2) const;
     Box getFeasibleRegionIntersection(const FlopCluster& c1, const FlopCluster& c2) const;
-    bool checkPlacementDensityConstraint(const FlopCluster& c1, odb::dbMaster* master1, const FlopCluster& c2, odb::dbMaster* master2, const Point& new_pos, odb::dbMaster* new_master);
+    Point project(const Box& hpwl_box, const Box& feasible_box) const;
+    std::vector<Point> generateUniformSamples(const Box& box, int p) const;
+    bool checkPlacementDensityConstraint(const FlopCluster& c1, odb::dbMaster* master1, 
+                                          const FlopCluster& c2, odb::dbMaster* master2, 
+                                          const Point& new_pos, odb::dbMaster* new_master);
+    double calcMergeHPWLGain(const FlopCluster& c1, const FlopCluster& c2, 
+                             const FloatPoint& merge_position, bool verbose = false) const;
+
+    //     [Level 4] Lower-level helpers
+    std::set<std::variant<odb::dbITerm*, odb::dbBTerm*>> getConnectedPins(const FlopCluster& cluster) const;
+    FloatPoint getPinCoordinate(const std::variant<odb::dbITerm*, odb::dbBTerm*>& pin_variant) const;
 
     // ╔═══════════════════════════════════════════════════════════════════╗
     // ║ Phase 10: runAgglomerativeClustering()                           ║
     // ╚═══════════════════════════════════════════════════════════════════╝
-    // [Level 1] Top-level: Execute merge operations and maintain graph
-    int mergeClusters(const Edge& merge_edge);
-    bool isFurtherMergeable(const FlopCluster& cluster) const;
     
-    //   [Level 2] Helpers for edge/region management
-    void removeEdges(const FlopCluster& cluster);
-    void updateEdges(const FlopCluster& cluster);
-    void updateFeasibleRegion(FlopCluster& cluster);
-    std::set<std::variant<odb::dbITerm*, odb::dbBTerm*>> getConnectedPins(const FlopCluster& cluster) const;
-    std::vector<FlopClusterEntry> getIntersectedCluster(const FlopCluster& cluster) const;
-    std::set<int> distributeSlack(const FlopCluster& cluster);
-    // [Level 1] Top-level: Calculate slack budgets for each pin
-    std::unordered_map<odb::dbITerm*, std::pair<int, sta::Slack>> calcUsedSlacks(const FlopUnit& flop_unit) const;
+    // [Level 1] Top-level: Execute merge operations and maintain graph
+    int mergeClusters(const Edge& merge_edge, bool verbose = false);
+    bool isFurtherMergeable(const FlopCluster& cluster, bool verbose = false) const;
+    void removeEdges(const FlopCluster& cluster, bool verbose = false);
+    std::set<int> distributeSlack(const FlopCluster& cluster, bool verbose = false);
+    void updateFeasibleRegion(FlopCluster& cluster, bool verbose = false);
+    
+    // [Level 2] Reverse engineering: Calculate used slacks from actual movement
+    std::unordered_map<odb::dbITerm*, std::vector<std::pair<int, sta::Slack>>> 
+    calcUsedSlacks(const FlopUnit& flop, bool verbose = false);
+    void calcUsedSlacksFanOut(const FlopUnit& flop, odb::dbITerm* out_pin, odb::dbMTerm* clk_pin_lib, est::EstimateParasitics* est, double unit_r, double unit_c, std::unordered_map<odb::dbITerm*, std::vector<std::pair<int, sta::Slack>>>& used_slacks, bool verbose = false);
+    void calcUsedSlacksFanIn(const FlopUnit& flop, odb::dbITerm* d_pin, est::EstimateParasitics* est, double unit_r, double unit_c, std::unordered_map<odb::dbITerm*, std::vector<std::pair<int, sta::Slack>>>& used_slacks, bool verbose = false);
 
     // ╔═══════════════════════════════════════════════════════════════════╗
     // ║ Phase 11: implementClusters()                                    ║
@@ -848,7 +861,6 @@ class AggloCluster
     void applyImplementation(const FlopCluster& cluster, const MasterPortAssignment& result, const std::vector<NetBundle>& net_bundles);
     odb::Rect getNetBBoxWithoutPin(odb::dbNet* net, odb::dbITerm* pin_to_ignore) const;
     Point getGlobalMTermPos(const Point& local_port_pos, odb::dbMaster* master, const Point& inst_center) const;
-    FloatPoint getPinCoordinate(const std::variant<odb::dbITerm*, odb::dbBTerm*>& pin_variant) const;
 
     // ╔═══════════════════════════════════════════════════════════════════╗
     // ║ General Utilities (used across multiple phases)                   ║
@@ -861,12 +873,9 @@ class AggloCluster
     // Coordinate transformation
     Point transformCoords(const Point& p) const;
     Point inverseTransformCoords(const Point& p) const;
-    Point project(const Box& hpwl_box, const Box& feasible_box) const;
     
     // Math utilities
     unsigned int roundDownToPowerOfTwo(unsigned int x);
-    double calcManhattanDistance(const FloatPoint& p1, const FloatPoint& p2) const;
-    std::vector<Point> generateUniformSamples(const Box& box, int p) const;
 
 };
 

@@ -232,7 +232,7 @@ void Replace::doClusterFlipFlops(int num_paths_per_endpoint,
   log_->info(GPL, 9989, "Execute clustering of flip-flops.");
 
   std::unique_ptr<AggloCluster> ag(new AggloCluster(
-      db_, sta_, log_, rs_, density, overflow, num_paths_per_endpoint, threads, verbose));
+      db_, sta_, log_, rs_, density, overflow, num_paths_per_endpoint, threads, 5, verbose));
   ac_ = std::move(ag);
 
   ac_->doAggloCluster();

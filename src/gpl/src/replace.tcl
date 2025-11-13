@@ -21,7 +21,7 @@ proc cluster_flip_flops { args } {
 
   set num_paths_per_endpoint 50
   set density 0.7
-  set overflow 0.1
+  set overflow 1.0
   set debug 0
 
   if { [info exists keys(-num_paths_per_endpoint)] } {
