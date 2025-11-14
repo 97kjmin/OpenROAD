@@ -236,6 +236,8 @@ void Replace::doClusterFlipFlops(int num_paths_per_endpoint,
   ac_ = std::move(ag);
 
   ac_->doAggloCluster();
+  
+  log_->info(GPL, 9993, "Clustering of flip-flops completed successfully.");
 }
 
 // -----------------------------------------------------------------------

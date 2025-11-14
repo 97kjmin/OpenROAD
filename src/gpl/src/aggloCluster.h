@@ -446,6 +446,7 @@ struct NetBundle
 struct PortBundle
 {
   int bundle_idx_{-1};              // Port bundle index (0, 1, 2, ...)
+  odb::dbMaster* master_{nullptr};  // Associated master
   odb::dbMTerm* d_mterm_{nullptr};  // D port master terminal
   odb::dbMTerm* q_mterm_{nullptr};  // Q port master terminal
   odb::dbMTerm* qn_mterm_{nullptr}; // QN port master terminal
@@ -848,19 +849,23 @@ class AggloCluster
     // ╔═══════════════════════════════════════════════════════════════════╗
     // ║ Phase 11: implementClusters()                                    ║
     // ╚═══════════════════════════════════════════════════════════════════╝
+    
     // [Level 1] Top-level: Convert clusters to MBFF instances
-    void implementSingleCluster(const FlopCluster& cluster);
+    bool implementSingleCluster(const FlopCluster& cluster, bool verbose = false, int debug_idx = -1);
     
-    //   [Level 2] Helpers for master selection and port assignment
-    MasterPortAssignment findBestMasterAndAssignment(const FlopCluster& cluster, const std::vector<NetBundle>& net_bundles);
+    // [Level 2] Helpers for master selection and port assignment
     std::vector<NetBundle> getNetBundles(const FlopCluster& cluster) const;
-    std::vector<PortBundle> getPortBundles(odb::dbMaster* master) const;
-    double calcAssignmentCost(const NetBundle& net_bundle, const PortBundle& port_bundle, odb::dbMaster* master, const Point& new_inst_origin) const;
-    
-    //     [Level 3] Lower-level helpers for implementation
+    std::map<odb::dbMaster*, std::vector<PortBundle>> getAllPortBundles(const FlopCluster& cluster, const std::vector<NetBundle>& net_bundles) const;
+    MasterPortAssignment assignPorts(const FlopCluster& cluster, 
+                                     const std::vector<NetBundle>& net_bundles,
+                                     const std::map<odb::dbMaster*, std::vector<PortBundle>>& master_port_bundles);
     void applyImplementation(const FlopCluster& cluster, const MasterPortAssignment& result, const std::vector<NetBundle>& net_bundles);
+                                     
+    // [Level 3] Lower-level helpers for implementation
+    double calcAssignmentCost(const NetBundle& net_bundle, const PortBundle& port_bundle, odb::dbMaster* master, const Point& new_inst_origin) const;
     odb::Rect getNetBBoxWithoutPin(odb::dbNet* net, odb::dbITerm* pin_to_ignore) const;
     Point getGlobalMTermPos(const Point& local_port_pos, odb::dbMaster* master, const Point& inst_center) const;
+    std::vector<PortBundle> getPortBundles(odb::dbMaster* master) const;
 
     // ╔═══════════════════════════════════════════════════════════════════╗
     // ║ General Utilities (used across multiple phases)                   ║

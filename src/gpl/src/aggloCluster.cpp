@@ -265,9 +265,9 @@ void AggloCluster::doAggloCluster()
 
   runAgglomerativeClustering();
 
-  exit(0); // Temporary exit for debugging
-
   implementClusters();
+  
+  log_->info(utl::GPL, 9992, "doAggloCluster() is returning to caller...");
 }
 
 //==============================================================================
@@ -1789,19 +1789,55 @@ AggloCluster::runAgglomerativeClustering()
 void 
 AggloCluster::implementClusters()
 {
-  // 1. 최종 클러스터 식별
+  if (verbose_) {
+    std::cout << "\n[implementClusters] Starting cluster implementation..." << std::endl;
+  }
+
+  // Step 1: Identify final clusters to implement
   std::vector<int> final_cluster_indices;
   for (int i = 0; i < flop_clusters_.size(); ++i) {
-    // 유효하고(valid), 병합된(size > 1) 클러스터
+    // Valid clusters with merged flops (size > 1)
     if (flop_cluster_is_valid_[i] && flop_clusters_[i].flops_.size() > 1) {
       final_cluster_indices.push_back(i);
     }
   }
 
-  // 2. 각 클러스터 구현
-  for (int cluster_idx : final_cluster_indices) {
-    implementSingleCluster(flop_clusters_[cluster_idx]);
+  if (verbose_) {
+    std::cout << "[Step 1] Identified " << final_cluster_indices.size() 
+              << " final clusters to implement" << std::endl;
   }
+
+  // Step 2: Implement each cluster
+  constexpr int DEBUG_SAMPLE_SIZE = 3;
+  int implemented_count = 0;
+  int skipped_count = 0;
+
+  for (int idx = 0; idx < final_cluster_indices.size(); ++idx) {
+    int cluster_idx = final_cluster_indices[idx];
+    bool show_debug = (idx < DEBUG_SAMPLE_SIZE) && verbose_;
+    
+    bool success = implementSingleCluster(flop_clusters_[cluster_idx], show_debug, idx);
+    
+    if (success) {
+      implemented_count++;
+    } else {
+      skipped_count++;
+    }
+  }
+
+  if (verbose_) {
+    if (final_cluster_indices.size() > DEBUG_SAMPLE_SIZE) {
+      std::cout << "\n  ... and " << (final_cluster_indices.size() - DEBUG_SAMPLE_SIZE) 
+                << " more clusters processed" << std::endl;
+    }
+    std::cout << "\n[Step 2] Implementation Summary:" << std::endl;
+    std::cout << "  Total clusters: " << final_cluster_indices.size() << std::endl;
+    std::cout << "  Successfully implemented: " << implemented_count << std::endl;
+    std::cout << "  Skipped: " << skipped_count << std::endl;
+    std::cout << "[implementClusters] Completed successfully.\n" << std::endl;
+  }
+  
+  log_->info(utl::GPL, 9991, "implementClusters() is returning to caller...");
 }
 
 //==============================================================================
@@ -5407,6 +5443,639 @@ AggloCluster::calcUsedSlacksFanIn(
 
 
 //==============================================================================
+// Phase 11: Implementation of Clusters Helper Functions
+//==============================================================================
+
+// -----------------------------------------------------------------------------
+// [Level 1] Top-level: Convert clusters to MBFF instances
+// -----------------------------------------------------------------------------
+
+bool 
+AggloCluster::implementSingleCluster(const FlopCluster& cluster, bool verbose, int debug_idx)
+{
+  if (verbose) {
+    std::cout << "\n╔═══════════════════════════════════════════════════════════════════╗" << std::endl;
+    std::cout << "║ Sample Cluster #" << debug_idx << " (Cluster ID: " << cluster.id_ << ")" << std::endl;
+    std::cout << "╚═══════════════════════════════════════════════════════════════════╝" << std::endl;
+    std::cout << "  Cluster Size: " << cluster.flops_.size() << " flops" << std::endl;
+    std::cout << "  Cluster Center: (" << cluster.curr_pt_.x << ", " << cluster.curr_pt_.y << ")" << std::endl;
+    
+    // Show flop details
+    std::cout << "  Flop IDs: [";
+    int flop_count = 0;
+    for (int flop_id : cluster.flops_) {
+      if (flop_count > 0) std::cout << ", ";
+      std::cout << flop_id;
+      if (++flop_count >= 5) {
+        std::cout << ", ...";
+        break;
+      }
+    }
+    std::cout << "]" << std::endl;
+  }
+
+  // Step 1: Extract net bundles from cluster
+  if (verbose) {
+    std::cout << "\n  [Step 1] Extracting net bundles from flops..." << std::endl;
+  }
+  
+  std::vector<NetBundle> net_bundles = getNetBundles(cluster);
+  
+  if (net_bundles.empty()) {
+    if (verbose) {
+      std::cout << "    ❌ SKIP: No valid net bundles found" << std::endl;
+    }
+    return false;
+  }
+  
+  if (verbose) {
+    std::cout << "    ✓ Extracted " << net_bundles.size() << " net bundles" << std::endl;
+    
+    // Show ALL net bundle information (no limit)
+    for (int i = 0; i < net_bundles.size(); ++i) {
+      const NetBundle& nb = net_bundles[i];
+      std::cout << "      Bundle[" << i << "]: Flop_" << nb.flop_id_ 
+                << " (" << nb.flop_inst_->getName() << ")" << std::endl;
+      
+      if (nb.d_net_) {
+        std::cout << "        D_net:  " << nb.d_net_->getName() 
+                  << " (fanout: " << nb.d_net_->getITermCount() << ")" << std::endl;
+      }
+      if (nb.q_net_) {
+        std::cout << "        Q_net:  " << nb.q_net_->getName() 
+                  << " (fanout: " << nb.q_net_->getITermCount() << ")" << std::endl;
+      }
+      if (nb.qn_net_) {
+        std::cout << "        QN_net: " << nb.qn_net_->getName() 
+                  << " (fanout: " << nb.qn_net_->getITermCount() << ")" << std::endl;
+      }
+    }
+  }
+  
+  // Step 2: Get port bundles for all candidate masters
+  if (verbose) {
+    std::cout << "\n  [Step 2] Analyzing candidate MBFF masters..." << std::endl;
+  }
+  
+  std::map<odb::dbMaster*, std::vector<PortBundle>> master_port_bundles 
+      = getAllPortBundles(cluster, net_bundles);
+  
+  if (master_port_bundles.empty()) {
+    if (verbose) {
+      std::cout << "    ❌ SKIP: No compatible MBFF masters found for " 
+                << net_bundles.size() << "-bit configuration" << std::endl;
+    }
+    return false;
+  }
+  
+  if (verbose) {
+    std::cout << "    ✓ Found " << master_port_bundles.size() << " compatible masters" << std::endl;
+    
+    // Show ALL master information (no limit)
+    int master_idx = 0;
+    for (const auto& [master, port_bundles] : master_port_bundles) {
+      std::cout << "      Master[" << master_idx << "]: " << master->getName() << std::endl;
+      std::cout << "        Size: " << master->getWidth() << " × " << master->getHeight() 
+                << " DBU² (Area: " << (master->getWidth() * master->getHeight()) << ")" << std::endl;
+      std::cout << "        Port bundles: " << port_bundles.size() << std::endl;
+      
+      // Show ALL port bundle details (no limit)
+      for (int i = 0; i < port_bundles.size(); ++i) {
+        const PortBundle& pb = port_bundles[i];
+        std::cout << "          Bundle[" << i << "]: ";
+        
+        if (pb.d_mterm_) {
+          std::cout << "D=" << pb.d_mterm_->getName() 
+                    << "@(" << pb.d_local_pos_.get<0>() << "," << pb.d_local_pos_.get<1>() << ")";
+        }
+        if (pb.q_mterm_) {
+          std::cout << ", Q=" << pb.q_mterm_->getName()
+                    << "@(" << pb.q_local_pos_.get<0>() << "," << pb.q_local_pos_.get<1>() << ")";
+        }
+        if (pb.qn_mterm_) {
+          std::cout << ", QN=" << pb.qn_mterm_->getName()
+                    << "@(" << pb.qn_local_pos_.get<0>() << "," << pb.qn_local_pos_.get<1>() << ")";
+        }
+        std::cout << std::endl;
+      }
+      
+      master_idx++;
+    }
+  }
+  
+  // Step 3: Find optimal master and port assignment using Hungarian algorithm
+  if (verbose) {
+    std::cout << "\n  [Step 3] Computing optimal port assignment (Hungarian algorithm)..." << std::endl;
+  }
+  
+  MasterPortAssignment best_assignment = assignPorts(cluster, net_bundles, master_port_bundles);
+  
+  if (best_assignment.best_master_ == nullptr) {
+    if (verbose) {
+      std::cout << "    ❌ SKIP: Hungarian algorithm failed to find valid assignment" << std::endl;
+    }
+    return false;
+  }
+  
+  if (verbose) {
+    std::cout << "    ✓ Optimal assignment found!" << std::endl;
+    std::cout << "      Selected master: " << best_assignment.best_master_->getName() << std::endl;
+    std::cout << "      Total HPWL cost: " << best_assignment.min_cost_ << " DBU" << std::endl;
+    
+    // Show ALL assignment mappings with detailed cost breakdown
+    std::cout << "      Net → Port assignment details:" << std::endl;
+    const auto& port_bundles = master_port_bundles.at(best_assignment.best_master_);
+    const Point inst_center(std::lround(cluster.curr_pt_.x), std::lround(cluster.curr_pt_.y));
+    
+    double total_cost_verification = 0.0;
+    
+    for (int i = 0; i < best_assignment.net_to_port_assignment_.size(); ++i) {
+      const int port_idx = best_assignment.net_to_port_assignment_[i];
+      const NetBundle& nb = net_bundles[i];
+      const PortBundle& pb = port_bundles[port_idx];
+      
+      std::cout << "        [" << i << "] Net Bundle (Flop_" << nb.flop_id_ << ") → Port Bundle[" << port_idx << "]" << std::endl;
+      
+      // Calculate detailed cost for each pin type
+      double d_cost = 0.0, q_cost = 0.0, qn_cost = 0.0;
+      
+      if (nb.d_net_ && pb.d_mterm_) {
+        odb::Rect bbox = getNetBBoxWithoutPin(nb.d_net_, nb.d_iterm_);
+        const Point global_pos = getGlobalMTermPos(pb.d_local_pos_, 
+                                                   best_assignment.best_master_, 
+                                                   inst_center);
+        bbox.merge(odb::Point(global_pos.get<0>(), global_pos.get<1>()));
+        d_cost = bbox.dx() + bbox.dy();
+        std::cout << "          D_net (" << nb.d_net_->getName() << ") → " << pb.d_mterm_->getName() 
+                  << ": HPWL = " << d_cost << " DBU" << std::endl;
+      }
+      
+      if (nb.q_net_ && pb.q_mterm_) {
+        odb::Rect bbox = getNetBBoxWithoutPin(nb.q_net_, nb.q_iterm_);
+        const Point global_pos = getGlobalMTermPos(pb.q_local_pos_, 
+                                                   best_assignment.best_master_, 
+                                                   inst_center);
+        bbox.merge(odb::Point(global_pos.get<0>(), global_pos.get<1>()));
+        q_cost = bbox.dx() + bbox.dy();
+        std::cout << "          Q_net (" << nb.q_net_->getName() << ") → " << pb.q_mterm_->getName() 
+                  << ": HPWL = " << q_cost << " DBU" << std::endl;
+      }
+      
+      if (nb.qn_net_ && pb.qn_mterm_) {
+        odb::Rect bbox = getNetBBoxWithoutPin(nb.qn_net_, nb.qn_iterm_);
+        const Point global_pos = getGlobalMTermPos(pb.qn_local_pos_, 
+                                                   best_assignment.best_master_, 
+                                                   inst_center);
+        bbox.merge(odb::Point(global_pos.get<0>(), global_pos.get<1>()));
+        qn_cost = bbox.dx() + bbox.dy();
+        std::cout << "          QN_net (" << nb.qn_net_->getName() << ") → " << pb.qn_mterm_->getName() 
+                  << ": HPWL = " << qn_cost << " DBU" << std::endl;
+      }
+      
+      double bundle_cost = d_cost + q_cost + qn_cost;
+      total_cost_verification += bundle_cost;
+      std::cout << "          Bundle total cost: " << bundle_cost << " DBU" << std::endl;
+    }
+    
+    std::cout << "      ──────────────────────────────────────" << std::endl;
+    std::cout << "      Sum of individual costs: " << total_cost_verification << " DBU" << std::endl;
+    std::cout << "      Hungarian algorithm cost: " << best_assignment.min_cost_ << " DBU" << std::endl;
+    
+    if (std::abs(total_cost_verification - best_assignment.min_cost_) < 1.0) {
+      std::cout << "      ✓ Cost verification PASSED" << std::endl;
+    } else {
+      std::cout << "      ⚠ Cost mismatch detected! Difference: " 
+                << std::abs(total_cost_verification - best_assignment.min_cost_) << " DBU" << std::endl;
+    }
+  }
+  
+  // Step 4: Apply implementation
+  if (verbose) {
+    std::cout << "\n  [Step 4] Creating MBFF instance and connecting nets..." << std::endl;
+  }
+  
+  applyImplementation(cluster, best_assignment, net_bundles);
+  
+  if (verbose) {
+    std::cout << "    ✓ Successfully created MBFF instance: mbff_cluster_" << cluster.id_ << std::endl;
+    std::cout << "    ✓ Destroyed " << net_bundles.size() << " original 1-bit flop instances" << std::endl;
+    std::cout << "\n  ✅ Cluster #" << debug_idx << " implementation COMPLETE" << std::endl;
+  }
+  
+  return true;
+}
+
+// -----------------------------------------------------------------------------
+// [Level 2] Helpers for master selection and port assignment
+// -----------------------------------------------------------------------------
+
+std::vector<NetBundle> 
+AggloCluster::getNetBundles(const FlopCluster& cluster) const
+{
+  std::vector<NetBundle> net_bundles;
+  net_bundles.reserve(cluster.flops_.size());
+
+  for (int flop_id : cluster.flops_) {
+    const FlopUnit& flop = flop_units_[flop_id];
+    NetBundle bundle;
+    bundle.flop_id_ = flop_id;
+    bundle.flop_inst_ = flop.inst_;
+
+    // Collect D, Q, QN nets and pins from this flop instance
+    for (odb::dbITerm* iterm : flop.inst_->getITerms()) {
+      if (isDPin(iterm)) {
+        bundle.d_net_ = iterm->getNet();
+        bundle.d_iterm_ = iterm;
+      } else if (isQPin(iterm)) {
+        bundle.q_net_ = iterm->getNet();
+        bundle.q_iterm_ = iterm;
+      } else if (isQNPin(iterm)) {
+        bundle.qn_net_ = iterm->getNet();
+        bundle.qn_iterm_ = iterm;
+      }
+    }
+    
+    // Valid bundle requires D net and at least one output (Q or QN)
+    if (bundle.d_net_ && (bundle.q_net_ || bundle.qn_net_)) {
+      net_bundles.push_back(bundle);
+    }
+  }
+  
+  return net_bundles;
+}
+
+std::map<odb::dbMaster*, std::vector<PortBundle>> 
+AggloCluster::getAllPortBundles(const FlopCluster& cluster, 
+                                 const std::vector<NetBundle>& net_bundles) const
+{
+  std::map<odb::dbMaster*, std::vector<PortBundle>> master_port_bundles;
+  
+  const int num_nets = net_bundles.size();
+  
+  // Check if compatible masters exist for this cluster's mask and bit-width
+  const auto mask_it = compatible_masters_.find(cluster.master_mask_);
+  if (mask_it == compatible_masters_.end()) {
+    return master_port_bundles;
+  }
+  
+  const auto bits_it = mask_it->second.find(num_nets);
+  if (bits_it == mask_it->second.end()) {
+    return master_port_bundles;
+  }
+  
+  const auto& candidate_masters = bits_it->second;
+  
+  // Extract port bundles from each candidate master
+  for (odb::dbMaster* master : candidate_masters) {
+    std::vector<PortBundle> port_bundles = getPortBundles(master);
+    
+    // Skip masters with insufficient port bundles
+    if (static_cast<int>(port_bundles.size()) < num_nets) {
+      continue;
+    }
+    
+    master_port_bundles[master] = std::move(port_bundles);
+  }
+  
+  return master_port_bundles;
+}
+
+MasterPortAssignment 
+AggloCluster::assignPorts(
+    const FlopCluster& cluster,
+    const std::vector<NetBundle>& net_bundles,
+    const std::map<odb::dbMaster*, std::vector<PortBundle>>& master_port_bundles)
+{
+  typedef util::StaticGraph<> Graph;
+
+  MasterPortAssignment best_result;
+  const int num_nets = net_bundles.size();
+  
+  if (master_port_bundles.empty()) {
+    return best_result;
+  }
+  
+  const Point inst_center(std::lround(cluster.curr_pt_.x), 
+                          std::lround(cluster.curr_pt_.y));
+
+  // Evaluate each candidate master
+  for (const auto& [master, port_bundles] : master_port_bundles) {
+    const int num_ports = port_bundles.size();
+    
+    if (num_ports < num_nets) {
+      continue;
+    }
+    
+    // Build bipartite graph: nets (left) <-> ports (right)
+    const int num_left_nodes = num_nets;
+    const int num_nodes = num_nets + num_ports;
+    const int num_arcs = num_nets * num_ports; 
+    
+    Graph graph(num_nodes, num_arcs);
+    std::vector<int64_t> arc_costs;
+    arc_costs.reserve(num_arcs);
+
+    // Create edges from each net to each port with HPWL cost
+    for (int i = 0; i < num_nets; ++i) {
+      for (int j = 0; j < num_ports; ++j) {
+        const int tail = i; 
+        const int head = num_left_nodes + j;
+        graph.AddArc(tail, head);
+        
+        const double cost_double = calcAssignmentCost(net_bundles[i], 
+                                                      port_bundles[j], 
+                                                      master,
+                                                      inst_center);
+        arc_costs.push_back(static_cast<int64_t>(std::round(cost_double)));
+      }
+    }
+
+    // Solve assignment using Hungarian algorithm
+    graph.Build();
+    ::operations_research::LinearSumAssignment assignment_solver(graph, num_left_nodes);
+
+    for (int arc = 0; arc < num_arcs; ++arc) {
+      assignment_solver.SetArcCost(arc, arc_costs[arc]);
+    }
+    
+    if (!assignment_solver.ComputeAssignment()) {
+      continue;
+    }
+    
+    const double total_cost = assignment_solver.GetCost();
+    
+    // Update best result if this master yields lower cost
+    if (total_cost < best_result.min_cost_) {
+      best_result.min_cost_ = total_cost;
+      best_result.best_master_ = master;
+      best_result.net_to_port_assignment_.resize(num_nets);
+      
+      for (int i = 0; i < num_left_nodes; ++i) {
+        const int assigned_global_node_idx = assignment_solver.GetMate(i);
+        const int j = assigned_global_node_idx - num_left_nodes;
+        best_result.net_to_port_assignment_[i] = j;
+      }
+    }
+  }
+  
+  return best_result;
+}
+
+
+void 
+AggloCluster::applyImplementation(const FlopCluster& cluster,
+                                  const MasterPortAssignment& result,
+                                  const std::vector<NetBundle>& net_bundles)
+{ 
+  odb::dbMaster* best_master = result.best_master_;
+  if (!best_master) {
+    return;
+  }
+  
+  const int num_bits = net_bundles.size();
+  
+  // Step 1: Create new MBFF instance
+  const std::string new_inst_name = "mbff_cluster_" + std::to_string(cluster.id_);
+  odb::dbInst* new_inst = odb::dbInst::create(block_, best_master, new_inst_name.c_str());
+  
+  if (!new_inst) {
+    log_->error(utl::GPL, 9974, "Failed to create new instance: {}", new_inst_name);
+    return;
+  }
+
+  // Step 2: Set instance placement (centered at cluster position)
+  const int center_x = std::lround(cluster.curr_pt_.x);
+  const int center_y = std::lround(cluster.curr_pt_.y);
+  const int origin_x = center_x - best_master->getWidth() / 2;
+  const int origin_y = center_y - best_master->getHeight() / 2;
+  
+  new_inst->setLocation(origin_x, origin_y);
+  new_inst->setPlacementStatus(odb::dbPlacementStatus::PLACED);
+
+  // Step 3: Connect common nets (CLK, CLR, PRE, SE, SI)
+  // All flops in cluster have identical InstMask
+  const InstMask& inst_mask = cluster.inst_mask_;
+  
+  for (odb::dbITerm* iterm : new_inst->getITerms()) {
+    if (isClockPin(iterm) && inst_mask.clock_net_) {
+      iterm->connect(inst_mask.clock_net_);
+    } else if (isClearPin(iterm) && inst_mask.clear_net_) {
+      iterm->connect(inst_mask.clear_net_);
+    } else if (isPresetPin(iterm) && inst_mask.preset_net_) {
+      iterm->connect(inst_mask.preset_net_);
+    } else if (isScanEnablePin(iterm) && inst_mask.scan_enable_net_) {
+      iterm->connect(inst_mask.scan_enable_net_);
+    } else if (isScanInPin(iterm) && inst_mask.scan_in_net_) {
+      iterm->connect(inst_mask.scan_in_net_);
+    }
+  }
+  
+  // Step 4: Connect data/scan nets based on Hungarian assignment
+  const std::vector<PortBundle> port_bundles = getPortBundles(best_master);
+
+  for (int i = 0; i < num_bits; ++i) {
+    const int j = result.net_to_port_assignment_[i];
+    
+    const NetBundle& net_b = net_bundles[i];
+    const PortBundle& port_b = port_bundles[j];
+
+    // Connect D pin
+    if (net_b.d_net_ && port_b.d_mterm_) {
+      net_b.d_iterm_->disconnect();
+      new_inst->getITerm(port_b.d_mterm_)->connect(net_b.d_net_);
+    }
+    
+    // Connect Q pin
+    if (net_b.q_net_ && port_b.q_mterm_) {
+      net_b.q_iterm_->disconnect(); 
+      new_inst->getITerm(port_b.q_mterm_)->connect(net_b.q_net_);
+    }
+    
+    // Connect QN pin
+    if (net_b.qn_net_ && port_b.qn_mterm_) {
+      net_b.qn_iterm_->disconnect();
+      new_inst->getITerm(port_b.qn_mterm_)->connect(net_b.qn_net_);
+    }
+  }
+
+  // Step 5: Destroy original 1-bit instances
+  for (const auto& net_b : net_bundles) {
+    odb::dbInst::destroy(net_b.flop_inst_);
+  }
+}
+
+// -----------------------------------------------------------------------------
+// [Level 3] Lower-level helpers for implementation
+// -----------------------------------------------------------------------------
+
+double 
+AggloCluster::calcAssignmentCost(const NetBundle& net_bundle,
+                                 const PortBundle& port_bundle,
+                                 odb::dbMaster* master,
+                                 const Point& new_inst_center) const
+{
+  double total_hpwl_cost = 0.0;
+
+  // Calculate HPWL cost for D pin
+  if (net_bundle.d_net_ && port_bundle.d_mterm_) {
+    odb::Rect bbox = getNetBBoxWithoutPin(net_bundle.d_net_, net_bundle.d_iterm_);
+    const Point global_pos = getGlobalMTermPos(port_bundle.d_local_pos_, 
+                                               master, 
+                                               new_inst_center);
+    bbox.merge(odb::Point(global_pos.get<0>(), global_pos.get<1>()));
+    total_hpwl_cost += bbox.dx() + bbox.dy();
+  }
+
+  // Calculate HPWL cost for Q pin
+  if (net_bundle.q_net_ && port_bundle.q_mterm_) {
+    odb::Rect bbox = getNetBBoxWithoutPin(net_bundle.q_net_, net_bundle.q_iterm_);
+    const Point global_pos = getGlobalMTermPos(port_bundle.q_local_pos_, 
+                                               master, 
+                                               new_inst_center);
+    bbox.merge(odb::Point(global_pos.get<0>(), global_pos.get<1>()));
+    total_hpwl_cost += bbox.dx() + bbox.dy();
+  }
+
+  // Calculate HPWL cost for QN pin
+  if (net_bundle.qn_net_ && port_bundle.qn_mterm_) {
+    odb::Rect bbox = getNetBBoxWithoutPin(net_bundle.qn_net_, net_bundle.qn_iterm_);
+    const Point global_pos = getGlobalMTermPos(port_bundle.qn_local_pos_, 
+                                               master, 
+                                               new_inst_center);
+    bbox.merge(odb::Point(global_pos.get<0>(), global_pos.get<1>()));
+    total_hpwl_cost += bbox.dx() + bbox.dy();
+  }
+  
+  return total_hpwl_cost;
+}
+
+odb::Rect 
+AggloCluster::getNetBBoxWithoutPin(odb::dbNet* net, odb::dbITerm* pin_to_ignore) const
+{
+  odb::Rect bbox;
+  bbox.mergeInit();
+  
+  if (!net) {
+    return bbox;
+  }
+
+  for (odb::dbITerm* iterm : net->getITerms()) {
+    if (iterm == pin_to_ignore) {
+      continue;
+    }
+    FloatPoint pin_coord = getPinCoordinate(iterm);
+    bbox.merge(odb::Point(static_cast<int>(pin_coord.x), static_cast<int>(pin_coord.y)));
+  }
+
+  for (odb::dbBTerm* bterm : net->getBTerms()) {
+    FloatPoint pin_coord = getPinCoordinate(bterm);
+    bbox.merge(odb::Point(static_cast<int>(pin_coord.x), static_cast<int>(pin_coord.y)));
+  }
+  
+  if (bbox.isInverted()) {
+      bbox.set_xlo(0); bbox.set_ylo(0); bbox.set_xhi(0); bbox.set_yhi(0);
+  }
+
+  return bbox;
+}
+
+Point 
+AggloCluster::getGlobalMTermPos(const Point& local_port_pos, 
+                                odb::dbMaster* master,
+                                const Point& inst_center) const
+{
+  // Calculate instance origin from center position
+  const int center_x = inst_center.get<0>();
+  const int center_y = inst_center.get<1>();
+  const int origin_x = center_x - master->getWidth() / 2;
+  const int origin_y = center_y - master->getHeight() / 2;
+
+  // Transform local port position to global coordinates
+  return Point(origin_x + local_port_pos.get<0>(), 
+               origin_y + local_port_pos.get<1>());
+}
+
+std::vector<PortBundle> 
+AggloCluster::getPortBundles(odb::dbMaster* master) const
+{
+  std::vector<PortBundle> port_bundles;
+
+  // Create temporary instance to analyze pin properties
+  const char* temp_inst_name = "_temp_port_bundle_check";
+  odb::dbInst* temp_inst = odb::dbInst::create(block_, master, temp_inst_name);
+  
+  if (!temp_inst) {
+    return port_bundles;
+  }
+
+  // Collect D, Q, QN pins separately using isDPin/isQPin/isQNPin functions
+  std::vector<odb::dbITerm*> d_pins;
+  std::vector<odb::dbITerm*> q_pins;
+  std::vector<odb::dbITerm*> qn_pins;
+
+  for (odb::dbITerm* iterm : temp_inst->getITerms()) {
+    if (isDPin(iterm)) {
+      d_pins.push_back(iterm);
+    } else if (isQPin(iterm)) {
+      q_pins.push_back(iterm);
+    } else if (isQNPin(iterm)) {
+      qn_pins.push_back(iterm);
+    }
+  }
+
+  // Assume the order is preserved: (D0, Q0, QN0), (D1, Q1, QN1), ...
+  // The number of bundles is determined by the number of D pins
+  const int num_bundles = d_pins.size();
+  port_bundles.reserve(num_bundles);
+
+  for (int i = 0; i < num_bundles; ++i) {
+    PortBundle bundle;
+    bundle.bundle_idx_ = i;
+    bundle.master_ = master;
+
+    // D pin (must exist)
+    if (i < d_pins.size()) {
+      odb::dbITerm* d_iterm = d_pins[i];
+      bundle.d_mterm_ = d_iterm->getMTerm();
+      
+      // Get D pin local position
+      odb::Rect bbox = bundle.d_mterm_->getBBox();
+      bundle.d_local_pos_.set<0>(bbox.xCenter());
+      bundle.d_local_pos_.set<1>(bbox.yCenter());
+    }
+
+    // Q pin (may not exist for all bundles)
+    if (i < q_pins.size()) {
+      odb::dbITerm* q_iterm = q_pins[i];
+      bundle.q_mterm_ = q_iterm->getMTerm();
+      
+      // Get Q pin local position
+      odb::Rect bbox = bundle.q_mterm_->getBBox();
+      bundle.q_local_pos_.set<0>(bbox.xCenter());
+      bundle.q_local_pos_.set<1>(bbox.yCenter());
+    }
+
+    // QN pin (may not exist for all bundles)
+    if (i < qn_pins.size()) {
+      odb::dbITerm* qn_iterm = qn_pins[i];
+      bundle.qn_mterm_ = qn_iterm->getMTerm();
+      
+      // Get QN pin local position
+      odb::Rect bbox = bundle.qn_mterm_->getBBox();
+      bundle.qn_local_pos_.set<0>(bbox.xCenter());
+      bundle.qn_local_pos_.set<1>(bbox.yCenter());
+    }
+
+    port_bundles.push_back(bundle);
+  }
+
+  // Destroy temporary instance
+  odb::dbInst::destroy(temp_inst);
+
+  return port_bundles;
+}
+
+//==============================================================================
 // Unit Conversion Helper Functions
 //==============================================================================
 
@@ -5459,626 +6128,6 @@ AggloCluster::roundDownToPowerOfTwo(unsigned int x)
   x |= (x >> 16);
   return x ^ (x >> 1);
 }
-
-// Implement
-
-void 
-AggloCluster::implementSingleCluster(const FlopCluster& cluster)
-{
-  // 1. 클러스터에 속한 1-bit FF들의 (D, Q, QN) 넷 번들 정보를 가져옵니다.
-  std::vector<NetBundle> net_bundles = getNetBundles(cluster);
-
-  if (net_bundles.empty()) {
-    if (verbose_) {
-      std::cout << "[implementSingleCluster] Cluster " << cluster.id_ 
-                << " (" << cluster.flops_.size() << " flops) has no valid net bundles. Skipping." << std::endl;
-    }
-    return;
-  }
-  
-  // 2. 헝가리안 알고리즘으로 HPWL이 최소가 되는 
-  //    '최적 마스터'와 '넷-핀 매핑'을 찾습니다.
-  MasterPortAssignment best_assignment = findBestMasterAndAssignment(cluster, net_bundles);
-
-  if (best_assignment.best_master_ == nullptr) {
-    if (verbose_) {
-      std::cout << "[implementSingleCluster] Cluster " << cluster.id_
-                << " (" << cluster.flops_.size() << " flops) found no valid master or assignment. Skipping." << std::endl;
-    }
-    return;
-  }
-
-  if (verbose_) {
-    std::cout << "[implementSingleCluster] Cluster " << cluster.id_ 
-              << ": Best master found: " << best_assignment.best_master_->getName()
-              << ". Assignment cost: " << best_assignment.min_cost_ << std::endl;
-  }
-
-  // 3. 찾은 최적의 결과를 바탕으로 실제 DB를 수정합니다.
-  //    (기존 Inst 삭제, 새 Inst 생성, 넷 연결)
-  applyImplementation(cluster, best_assignment, net_bundles);
-}
-
-std::vector<NetBundle> 
-AggloCluster::getNetBundles(const FlopCluster& cluster) const
-{
-  throw std::logic_error("getNetBundles not implemented");
-  // std::vector<NetBundle> net_bundles;
-  // net_bundles.reserve(cluster.flops_.size());
-
-  // for (int flop_id : cluster.flops_) {
-  //   const FlopUnit& flop = flop_units_[flop_id];
-  //   NetBundle bundle;
-  //   bundle.flop_id_ = flop_id;
-  //   bundle.flop_inst_ = flop.inst_;
-
-  //   for (odb::dbITerm* iterm : flop.inst_->getITerms()) {
-  //     if (isDPin(iterm)) {
-  //       bundle.d_net_ = iterm->getNet();
-  //       bundle.d_iterm_ = iterm;
-  //     } else if (isQPin(iterm)) {
-  //       bundle.q_net_ = iterm->getNet();
-  //       bundle.q_iterm_ = iterm;
-  //     } else if (isQNPin(iterm)) {
-  //       bundle.qn_net_ = iterm->getNet();
-  //       bundle.qn_iterm_ = iterm;
-  //     }
-  //   }
-    
-  //   // D와 Q(또는 QN) 넷이 모두 존재해야 유효한 번들로 간주
-  //   if (bundle.d_net_ && (bundle.q_net_ || bundle.qn_net_)) {
-  //       net_bundles.push_back(bundle);
-  //   } else {
-  //       log_->warn(utl::GPL, 9970, "Flop {} ({}) is missing D/Q/QN nets. Excluding from bundle.",
-  //                  flop.inst_->getName(), flop_id);
-  //   }
-  // }
-  // return net_bundles;
-}
-
-MasterPortAssignment 
-AggloCluster::findBestMasterAndAssignment(
-    const FlopCluster& cluster,
-    const std::vector<NetBundle>& net_bundles)
-{
-  throw std::logic_error("findBestMasterAndAssignment not implemented");
-  // typedef util::StaticGraph<> Graph;
-
-  // MasterPortAssignment best_result;
-  // const int num_nets = net_bundles.size();
-  
-  // if (compatible_masters_.find(cluster.master_mask_) == compatible_masters_.end() ||
-  //     compatible_masters_.at(cluster.master_mask_).find(num_nets) == compatible_masters_.at(cluster.master_mask_).end()) {
-  //     log_->warn(utl::GPL, 9971, "No compatible {}-bit masters found for cluster {}.", num_nets, cluster.id_);
-  //     return best_result;
-  // }
-  
-  // const auto& candidate_masters = compatible_masters_.at(cluster.master_mask_).at(num_nets);
-  
-  // Point inst_center(std::lround(cluster.curr_pt_.x), std::lround(cluster.curr_pt_.y));
-
-  // for (odb::dbMaster* master : candidate_masters) {
-    
-  //   std::vector<PortBundle> port_bundles = getPortBundles(master);
-  //   const int num_ports = port_bundles.size();
-
-  //   if (num_ports < num_nets) {
-  //     log_->warn(utl::GPL, 9972, "Master {} has only {} port bundles, but cluster needs {}. Skipping.",
-  //                master->getName(), num_ports, num_nets);
-  //     continue;
-  //   }
-    
-  //   const int num_left_nodes = num_nets;
-  //   const int num_nodes = num_nets + num_ports;
-  //   const int num_arcs = num_nets * num_ports; 
-    
-  //   Graph graph(num_nodes, num_arcs);
-  //   std::vector<int64_t> arc_costs;
-  //   arc_costs.reserve(num_arcs);
-
-  //   for (int i = 0; i < num_nets; ++i) {
-  //     for (int j = 0; j < num_ports; ++j) {
-  //       int tail = i; 
-  //       int head = num_left_nodes + j;
-  //       graph.AddArc(tail, head);
-        
-  //       // [호출부 수정] 'master' 포인터를 calcAssignmentCost로 전달
-  //       double cost_double = calcAssignmentCost(net_bundles[i], 
-  //                                               port_bundles[j], 
-  //                                               master,           // <-- [수정] master 전달
-  //                                               inst_center);
-        
-  //       arc_costs.push_back(static_cast<int64_t>(std::round(cost_double)));
-  //     }
-  //   }
-
-  //   graph.Build();
-  //   ::operations_research::LinearSumAssignment assignment_solver(graph, num_left_nodes);
-
-  //   for (int arc = 0; arc < num_arcs; ++arc) {
-  //     assignment_solver.SetArcCost(arc, arc_costs[arc]);
-  //   }
-    
-  //   if (assignment_solver.ComputeAssignment()) {
-  //     double total_cost = assignment_solver.GetCost();
-      
-  //     if (total_cost < best_result.min_cost_) {
-  //       best_result.min_cost_ = total_cost;
-  //       best_result.best_master_ = master;
-  //       best_result.net_to_port_assignment_.resize(num_nets);
-        
-  //       for (int i = 0; i < num_left_nodes; ++i) {
-  //         int assigned_global_node_idx = assignment_solver.GetMate(i);
-  //         int j = assigned_global_node_idx - num_left_nodes;
-  //         best_result.net_to_port_assignment_[i] = j;
-  //       }
-  //     }
-  //   } else {
-  //       log_->warn(utl::GPL, 109, "Hungarian assignment failed for master {}.", master->getName());
-  //   }
-  // }
-  
-  // return best_result;
-}
-
-/**
- * @brief (헝가리안 비용함수) 
- * 특정 넷 번들을 특정 포트 번들에 할당했을 때의 HPWL 비용을 계산합니다.
- */
-double 
-AggloCluster::calcAssignmentCost(const NetBundle& net_bundle,
-                                 const PortBundle& port_bundle,
-                                 odb::dbMaster* master,         // <-- [수정] master 받기
-                                 const Point& new_inst_center) const
-{
-  throw std::logic_error("calcAssignmentCost not implemented");
-  // double total_hpwl_cost = 0.0;
-
-  // // 1. 'D' 핀 비용 계산
-  // if (net_bundle.d_net_ && port_bundle.d_mterm_) {
-  //   odb::Rect bbox_d = getNetBBoxWithoutPin(net_bundle.d_net_, net_bundle.d_iterm_);
-  //   Point global_d_pos = getGlobalMTermPos(port_bundle.d_local_pos_, master, new_inst_center);
-  //   bbox_d.merge(global_d_pos);
-  //   total_hpwl_cost += bbox_d.dx() + bbox_d.dy();
-  // }
-
-  // // 2. 'Q' 핀 비용 계산
-  // if (net_bundle.q_net_ && port_bundle.q_mterm_) {
-  //   odb::Rect bbox_q = getNetBBoxWithoutPin(net_bundle.q_net_, net_bundle.q_iterm_);
-  //   Point global_q_pos = getGlobalMTermPos(port_bundle.q_local_pos_, master, new_inst_center);
-  //   bbox_q.merge(global_q_pos);
-  //   total_hpwl_cost += bbox_q.dx() + bbox_q.dy();
-  // }
-
-  // // 3. 'QN' 핀 비용 계산
-  // if (net_bundle.qn_net_ && port_bundle.qn_mterm_) {
-  //   odb::Rect bbox_qn = getNetBBoxWithoutPin(net_bundle.qn_net_, net_bundle.qn_iterm_);
-  //   Point global_qn_pos = getGlobalMTermPos(port_bundle.qn_local_pos_, master, new_inst_center);
-  //   bbox_qn.merge(global_qn_pos);
-  //   total_hpwl_cost += bbox_qn.dx() + bbox_qn.dy();
-  // }
-  
-  // return total_hpwl_cost;
-}
-
-odb::Rect 
-AggloCluster::getNetBBoxWithoutPin(odb::dbNet* net, odb::dbITerm* pin_to_ignore) const
-{
-  odb::Rect bbox;
-  bbox.mergeInit();
-  
-  if (!net) {
-    return bbox;
-  }
-
-  for (odb::dbITerm* iterm : net->getITerms()) {
-    if (iterm == pin_to_ignore) {
-      continue;
-    }
-    // [수정] 핀 위치가 아닌 인스턴스의 BBox 중심으로 HPWL 계산
-    // (또는 getAvgXY 사용)
-    int x, y;
-    if (iterm->getAvgXY(&x, &y)) {
-       bbox.merge(odb::Point(x,y));
-    }
-  }
-
-  for (odb::dbBTerm* bterm : net->getBTerms()) {
-    odb::Rect bterm_bbox = bterm->getBBox();
-    if (!bterm_bbox.isInverted()) {
-        bbox.merge(bterm_bbox);
-    }
-  }
-  
-  if (bbox.isInverted()) {
-      bbox.set_xlo(0); bbox.set_ylo(0); bbox.set_xhi(0); bbox.set_yhi(0);
-  }
-
-  return bbox;
-}
-
-Point 
-AggloCluster::getGlobalMTermPos(const Point& local_port_pos, 
-                                odb::dbMaster* master,         // <-- [수정] master 받기
-                                const Point& inst_center) const
-{
-  // [로직 수정]
-  // local_port_pos는 마스터의 원점(0,0) 기준 핀의 로컬 좌표입니다.
-  // inst_center는 새 인스턴스의 중심 좌표입니다.
-
-  throw std::logic_error("getGlobalMTermPos not implemented");
-
-  // // 1. 인스턴스의 원점(Origin)을 계산합니다.
-  // int center_x = inst_center.get<0>();
-  // int center_y = inst_center.get<1>();
-  // int origin_x = center_x - master->getWidth() / 2;
-  // int origin_y = center_y - master->getHeight() / 2;
-
-  // // 2. 핀의 글로벌 좌표 = 인스턴스 원점 + 핀의 로컬 좌표
-  // return Point(origin_x + local_port_pos.get<0>(), 
-  //              origin_y + local_port_pos.get<1>());
-}
-
-// /**
-//  * @brief 마스터의 로컬 MTerm 좌표를 글로벌 좌표(DBU)로 변환합니다.
-//  */
-// Point 
-// AggloCluster::getGlobalMTermPos(const Point& local_port_pos, 
-//                                 const Point& inst_center) const
-// {
-//   throw std::logic_error("getGlobalMTermPos not implemented");
-//   // [주의] inst_center는 인스턴스의 *중심*입니다. 
-//   //        local_port_pos는 마스터의 *원점(0,0)* 기준입니다.
-//   //        정확한 계산을 위해서는 마스터의 (width/2, height/2) 오프셋이 필요합니다.
-//   //        하지만, 여기서는 모든 MTerm에 동일한 오프셋이 적용되므로
-//   //        inst_center를 임시 원점으로 사용해도 비용 계산(상대 비교)은 유효합니다.
-  
-//   // // [간단한 구현]
-//   // // (inst_center가 (0,0)이라 가정할 때의 mterm 위치) + (실제 inst_center 위치)
-//   // return Point(inst_center.get<0>() + local_port_pos.get<0>(),
-//   //              inst_center.get<1>() + local_port_pos.get<1>());
-
-//   // [더 정확한 구현 (master 포인터 필요)]
-//   // int center_x = inst_center.get<0>();
-//   // int center_y = inst_center.get<1>();
-//   // int origin_x = center_x - master->getWidth() / 2;
-//   // int origin_y = center_y - master->getHeight() / 2;
-//   // return Point(origin_x + local_port_pos.get<0>(), 
-//   //              origin_y + local_port_pos.get<1>());
-// }
-
-void 
-AggloCluster::applyImplementation(const FlopCluster& cluster,
-                                  const MasterPortAssignment& result,
-                                  const std::vector<NetBundle>& net_bundles)
-{
-
-  throw std::logic_error("applyImplementation not implemented");
-  // --- 이 함수는 실제 DB를 수정하므로 매우 주의해야 합니다 ---
-  
-  // odb::dbMaster* best_master = result.best_master_;
-  // if (!best_master) {
-  //     return;
-  // }
-  
-  // int num_bits = net_bundles.size();
-  
-  // // 1. 새 MBFF 인스턴스 생성
-  // std::string new_inst_name = "mbff_cluster_" + std::to_string(cluster.id_);
-  // odb::dbInst* new_inst = odb::dbInst::create(block_, best_master, new_inst_name.c_str());
-  
-  // if (!new_inst) {
-  //     log_->error(utl::GPL, 9974, "Failed to create new instance: {}", new_inst_name);
-  //     return;
-  // }
-
-  // // 2. 새 인스턴스 위치 설정 (중심점 기준)
-  // int center_x = std::lround(cluster.curr_pt_.x);
-  // int center_y = std::lround(cluster.curr_pt_.y);
-  // int origin_x = center_x - best_master->getWidth() / 2;
-  // int origin_y = center_y - best_master->getHeight() / 2;
-  // new_inst->setLocation(origin_x, origin_y);
-  // new_inst->setPlacementStatus(odb::dbPlacementStatus::PLACED);
-
-  // // 3. 공통 넷 연결 (CLK, CLR, PRE, SE 등)
-  // // (InstMask는 클러스터 내 모든 FF가 동일하다고 가정)
-  // const InstMask& inst_mask = cluster.inst_mask_;
-  
-  // if (inst_mask.clock_net_) {
-  //   odb::dbMTerm* clk_mterm = best_master->findMTerm("CK"); // "CK" 또는 "CLK" 등
-  //   if (clk_mterm) new_inst->getITerm(clk_mterm)->connect(inst_mask.clock_net_);
-  // }
-  // if (inst_mask.clear_net_) {
-  //   odb::dbMTerm* clr_mterm = best_master->findMTerm("CLR"); // "CLR" 또는 "R" 등
-  //   if (clr_mterm) new_inst->getITerm(clr_mterm)->connect(inst_mask.clear_net_);
-  // }
-  // if (inst_mask.preset_net_) {
-  //   odb::dbMTerm* pre_mterm = best_master->findMTerm("PRE"); // "PRE" 또는 "S" 등
-  //   if (pre_mterm) new_inst->getITerm(pre_mterm)->connect(inst_mask.preset_net_);
-  // }
-  // if (inst_mask.scan_enable_net_) {
-  //   odb::dbMTerm* se_mterm = best_master->findMTerm("SE"); // "SE" 등
-  //   if (se_mterm) new_inst->getITerm(se_mterm)->connect(inst_mask.scan_enable_net_);
-  // } 
-  // if (inst_mask.scan_in_net_) {
-  //   odb::dbMTerm* si_mterm = best_master->findMTerm("SI"); // "SE" 등
-  //   if (si_mterm) new_inst->getITerm(si_mterm)->connect(inst_mask.scan_in_net_);    
-  // }
-  
-  // // 4. 데이터/스캔 넷 연결 (헝가리안 할당 결과 기반)
-  // std::vector<PortBundle> port_bundles = getPortBundles(best_master);
-
-  // for (int i = 0; i < num_bits; ++i) { // i = 넷 번들 인덱스
-  //   int j = result.net_to_port_assignment_[i]; // j = 포트 번들 인덱스
-    
-  //   const NetBundle& net_b = net_bundles[i];
-  //   const PortBundle& port_b = port_bundles[j]; // [j]가 포트 번들 인덱스
-
-  //   // D 핀 연결
-  //   if (net_b.d_net_ && port_b.d_mterm_) {
-  //     net_b.d_iterm_->disconnect(); // 기존 핀 연결 해제
-  //     new_inst->getITerm(port_b.d_mterm_)->connect(net_b.d_net_);
-  //   }
-  //   // Q 핀 연결
-  //   if (net_b.q_net_ && port_b.q_mterm_) {
-  //     net_b.q_iterm_->disconnect(); 
-  //     new_inst->getITerm(port_b.q_mterm_)->connect(net_b.q_net_);
-  //   }
-  //   // QN 핀 연결
-  //   if (net_b.qn_net_ && port_b.qn_mterm_) {
-  //     net_b.qn_iterm_->disconnect();
-  //     new_inst->getITerm(port_b.qn_mterm_)->connect(net_b.qn_net_);
-  //   }
-  //   // (필요시 SI/SO 핀 로직 추가)
-  // }
-
-  // // 5. 기존 1-bit 인스턴스 삭제
-  // for (const auto& net_b : net_bundles) {
-  //   odb::dbInst::destroy(net_b.inst_);
-  // }
-}
-
-std::vector<PortBundle> 
-AggloCluster::getPortBundles(odb::dbMaster* master) const
-{
-  throw std::logic_error("getPortBundles not implemented");
-  // // 정규식: (D, Q, QN, SI, SO)로 시작하고 (그룹 1)
-  // //         (\d+) : 1개 이상의 숫자로 끝남 (그룹 2)
-  // std::regex pin_regex(R"(^(D|Q|QN)(\d+)$)");
-  // std::smatch match;
-
-  // // Key: 핀 이름에서 추출한 인덱스 (e.g., "QN0" -> 0, "D1" -> 1)
-  // std::map<int, PortBundle> port_map; 
-
-  // for (odb::dbMTerm* mterm : master->getMTerms()) {
-  //   std::string mterm_name = mterm->getName();
-    
-  //   if (std::regex_match(mterm_name, match, pin_regex) && match.size() == 3) {
-      
-  //     std::string type = match[1].str(); // "D", "Q", "QN" 등
-      
-  //     // [수정] 핀 이름의 숫자를 정수로 변환하여 인덱스로 바로 사용
-  //     int index = std::stoi(match[2].str()); // e.g., "0", "1", "2" ...
-
-  //     PortBundle& bundle = port_map[index]; // 맵에 접근 (없으면 생성)
-  //     bundle.bundle_idx_ = index;
-
-  //     // 핀의 로컬 좌표 계산 (MTerm의 BBox 중심 사용)
-  //     Point local_pos(0, 0);
-  //     odb::Rect bbox;
-  //     if (mterm->getBBox(bbox)) { 
-  //         local_pos.set<0>(bbox.xCenter());
-  //         local_pos.set<1>(bbox.yCenter());
-  //     } 
-
-  //     if (type == "D") {
-  //       bundle.d_mterm_ = mterm;
-  //       bundle.d_local_pos_ = local_pos;
-  //     } else if (type == "Q") {
-  //       bundle.q_mterm_ = mterm;
-  //       bundle.q_local_pos_ = local_pos;
-  //     } else if (type == "QN") {
-  //       bundle.qn_mterm_ = mterm;
-  //       bundle.qn_local_pos_ = local_pos;
-  //     }
-  //   }
-  // }
-
-  // std::vector<PortBundle> port_bundles;
-  // port_bundles.reserve(port_map.size());
-  // for (auto const& [index, bundle] : port_map) {
-  //   port_bundles.push_back(bundle);
-  // }
-  // return port_bundles;
-}
-
-
-
-
-
-// float AggloCluster::calcHPWL(const std::vector<int>& flop_indices,
-//                                   const std::vector<odb::Point>& cluster_centers) const
-// {
-//   std::set<odb::dbNet*> nets;
-//   std::set<odb::dbInst*> cluster_insts;
-//   for (int flop_idx : flop_indices) {
-//     cluster_insts.insert(flop_units_[flop_idx].inst_);
-//   }
-
-//   auto pins = ConnectedPins(flop_indices);
-//   for (const auto& pin_variant : pins) {
-//     std::visit(
-//         [&](auto&& arg) {
-//           if (arg->getNet()) {
-//             nets.insert(arg->getNet());
-//           }
-//         },
-//         pin_variant);
-//   }
-
-//   float total_hpwl = 0;
-//   for (odb::dbNet* net : nets) {
-//     odb::Rect net_bbox;
-//     net_bbox.mergeInit();
-
-//     for (odb::dbITerm* iterm : net->getITerms()) {
-//       // Exclude ITerms belonging to the flops in the cluster
-//       if (cluster_insts.find(iterm->getInst()) == cluster_insts.end()) {
-//         // Use instance's BBox for HPWL calculation, not pin's BBox
-//         net_bbox.merge(iterm->getInst()->getBBox()->getBox());
-//       }
-//     }
-//     for (odb::dbBTerm* bterm : net->getBTerms()) {
-//       for (auto bpin : bterm->getBPins()) {
-//         net_bbox.merge(bpin->getBBox());
-//       }
-//     }
-
-//     for (const auto& center : cluster_centers) {
-//       net_bbox.merge(center);
-//     }
-
-//     total_hpwl += net_bbox.dx() + net_bbox.dy();
-//   }
-
-//   return total_hpwl;
-// }
-
-// std::set<std::variant<odb::dbITerm*, odb::dbBTerm*>>
-// AggloCluster::getConnectedPins(const std::vector<int>& flop_indices) const
-// {
-//   std::set<std::variant<odb::dbITerm*, odb::dbBTerm*>> connected_pins;
-//   std::set<odb::dbInst*> cluster_insts;
-//   for (int flop_idx : flop_indices) {
-//     cluster_insts.insert(flop_units_[flop_idx].inst_);
-//   }
-
-//   for (int flop_idx : flop_indices) {
-//     const FlopUnit& flop = flop_units_[flop_idx];
-//     for (odb::dbITerm* iterm : flop.inst_->getITerms()) {
-//       odb::dbNet* net = iterm->getNet();
-//       if (net == nullptr
-//           || (net->getSigType() != odb::dbSigType::SIGNAL
-//               && net->getSigType() != odb::dbSigType::CLOCK)) {
-//         continue;
-//       }
-//       for (odb::dbITerm* net_iterm : net->getITerms()) {
-//         if (cluster_insts.find(net_iterm->getInst()) == cluster_insts.end()) {
-//           connected_pins.insert(net_iterm);
-//         }
-//       }
-//       for (odb::dbBTerm* net_bterm : net->getBTerms()) {
-//         connected_pins.insert(net_bterm);
-//       }
-//     }
-//   }
-//   return connected_pins;
-// }
-
-
-
-// PlacementResult AggloCluster::calcPlacementLoc(int cluster_idx1, int cluster_idx2)
-// {
-//   PlacementResult result;
-  
-//   const Box& box1 = flop_clusters_[cluster_idx1].feasible_region_;
-//   const Box& box2 = flop_clusters_[cluster_idx2].feasible_region_;
-
-//   Box intersection_box;
-//   boost::geometry::intersection(box1, box2, intersection_box);
-
-//   if (boost::geometry::is_empty(intersection_box)) {
-//     return result;
-//   }
-
-//   std::vector<int> merged_flops;
-//   merged_flops.insert(merged_flops.end(),
-//                       flop_clusters_[cluster_idx1].flops_.begin(),
-//                       flop_clusters_[cluster_idx1].flops_.end());
-//   merged_flops.insert(merged_flops.end(),
-//                       flop_clusters_[cluster_idx2].flops_.begin(),
-//                       flop_clusters_[cluster_idx2].flops_.end());
-//   auto connected_pins = getConnectedPins(merged_flops);
-
-//   // Calculate original HPWL
-//   const auto& c1 = flop_clusters_[cluster_idx1];
-//   const auto& c2 = flop_clusters_[cluster_idx2];
-//   std::vector<odb::Point> original_centers;
-//   original_centers.emplace_back(c1.curr_pt_.x, c1.curr_pt_.y);
-//   original_centers.emplace_back(c2.curr_pt_.x, c2.curr_pt_.y);
-//   float original_hpwl = calcHPWL(merged_flops, original_centers);
-
-//   // Remove cluster's own pins to get external pins for median calculation
-//   // This part of your logic seems to be for finding the best placement location
-//   // by considering external connections.
-
-//   std::vector<odb::Point> connected_pin_coords;
-//   for (const auto& pin_variant : connected_pins) {
-//     std::visit(
-//         [&](auto&& arg) {
-//           using T = std::decay_t<decltype(arg)>;
-//           odb::Rect bbox;
-//           if constexpr (std::is_same_v<T, odb::dbITerm*>) {
-//             bbox = arg->getInst()->getBBox()->getBox();
-//           } else if constexpr (std::is_same_v<T, odb::dbBTerm*>) {
-//             for (auto bpin : arg->getBPins()) {
-//               bbox.merge(bpin->getBBox());
-//             }
-//           }
-//           connected_pin_coords.emplace_back(bbox.xCenter(), bbox.yCenter());
-//         },
-//         pin_variant);
-//   }
-
-//   // 3. Calculate the HPWL-minimizing median point
-//   FloatPoint median_point;
-//   if (connected_pin_coords.empty()) {
-//     median_point = {0.0, 0.0};
-//   } else {
-//     std::vector<float> x_coords, y_coords;
-//     x_coords.reserve(connected_pin_coords.size());
-//     y_coords.reserve(connected_pin_coords.size());
-
-//     for (const auto& pt : connected_pin_coords) {
-//       x_coords.push_back(pt.getX());
-//       y_coords.push_back(pt.getY());
-//     }
-
-//     size_t mid_idx = x_coords.size() / 2;
-//     std::nth_element(x_coords.begin(), x_coords.begin() + mid_idx, x_coords.end());
-//     std::nth_element(y_coords.begin(), y_coords.begin() + mid_idx, y_coords.end());
-//     median_point = {x_coords[mid_idx], y_coords[mid_idx]};
-//   }
-
-//   // 4. Find the closest point in the intersection_box to the median_point
-//   // Transform median_point to the rotated coordinate system
-//   Point median_pt_transformed = transformCoords(Point(median_point.x, median_point.y));
-//   Point closest_pt_bg;
-
-//   // Find the closest point in the rotated space
-//   if (boost::geometry::within(median_pt_transformed, intersection_box)) {
-//     closest_pt_bg = median_pt_transformed;
-//   } else {
-//     float closest_x = std::max((float) intersection_box.min_corner().get<0>(),
-//                    std::min((float) median_pt_transformed.get<0>(), (float) intersection_box.max_corner().get<0>()));
-//     float closest_y = std::max((float) intersection_box.min_corner().get<1>(),
-//                    std::min((float) median_pt_transformed.get<1>(), (float) intersection_box.max_corner().get<1>()));
-//     closest_pt_bg.set<0>(closest_x);
-//     closest_pt_bg.set<1>(closest_y);
-//   }
-
-//   // Transform the result back to the original coordinate system
-//   closest_pt_bg = inverseTransformCoords(closest_pt_bg);
-//   result.placement_loc = {static_cast<float>(closest_pt_bg.get<0>()),
-//                           static_cast<float>(closest_pt_bg.get<1>())};
-//   // Calculate merged HPWL
-//   float merged_hpwl = calcHPWL(merged_flops,
-//                                {odb::Point(result.placement_loc.x, result.placement_loc.y)}); 
-
-//   result.gain = static_cast<double>(original_hpwl - merged_hpwl);
-//   result.valid = true;
-//   return result;
-// }
 
 
 
