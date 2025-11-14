@@ -7,27 +7,26 @@ sta::define_cmd_args "cluster_flip_flops" {\
     [-num_paths_per_endpoint num_paths]\
     [-density density]\
     [-overflow overflow]\
+    [-region_scale_factor scale_factor]\
+    [-num_samples num_samples]\
     [-debug]
 }
 
 proc cluster_flip_flops { args } {
   sta::parse_key_args "cluster_flip_flops" args \
-    keys { -num_paths_per_endpoint -density -overflow } \
+    keys { -num_paths_per_endpoint -density -overflow -region_scale_factor -num_samples } \
     flags { -debug }
 
   if { [ord::get_db_block] == "NULL" } {
     utl::error GPL 9990 "No design block found."
   }
 
-  set num_paths_per_endpoint 50
   set density 0.7
-  set overflow 1.0
+  set overflow 0.2
+  set region_scale_factor 3.0
+  set num_paths_per_endpoint 50
+  set num_samples 10
   set debug 0
-
-  if { [info exists keys(-num_paths_per_endpoint)] } {
-    set num_paths_per_endpoint $keys(-num_paths_per_endpoint)
-    sta::check_positive_integer "-num_paths_per_endpoint" $num_paths_per_endpoint
-  }
 
   if { [info exists keys(-density)] } {
     set density $keys(-density)
@@ -39,11 +38,26 @@ proc cluster_flip_flops { args } {
     sta::check_positive_float "-overflow" $overflow
   }
 
+  if { [info exists keys(-region_scale_factor)] } {
+    set region_scale_factor $keys(-region_scale_factor)
+    sta::check_positive_float "-region_scale_factor" $region_scale_factor
+  }
+
+  if { [info exists keys(-num_paths_per_endpoint)] } {
+    set num_paths_per_endpoint $keys(-num_paths_per_endpoint)
+    sta::check_positive_integer "-num_paths_per_endpoint" $num_paths_per_endpoint
+  }
+
+  if { [info exists keys(-num_samples)] } {
+    set num_samples $keys(-num_samples)
+    sta::check_positive_integer "-num_samples" $num_samples
+  }
+
   if { [info exists flags(-debug)] } {
     set debug 1 
   }
 
-  gpl::replace_run_cluster_flip_flops_cmd $num_paths_per_endpoint $density $overflow $debug
+  gpl::replace_run_cluster_flip_flops_cmd $density $overflow $region_scale_factor $num_paths_per_endpoint $num_samples $debug
 }
 
 # -----------------------------------------------------------------------

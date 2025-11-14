@@ -22,38 +22,50 @@
 // 7. Main engine: AggloCluster (orchestrates the entire clustering flow)
 //==============================================================================
 
-#include <boost/geometry.hpp>
-#include <boost/geometry/geometries/box.hpp>
-#include <boost/geometry/geometries/point.hpp>
-#include <boost/geometry/index/rtree.hpp>
+// Standard library
 #include <cstdint>
 #include <map>
-#include <ostream>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <variant>
 #include <vector>
+
+// Boost geometry
+#include <boost/geometry.hpp>
+#include <boost/geometry/geometries/box.hpp>
+#include <boost/geometry/geometries/point.hpp>
+#include <boost/geometry/index/rtree.hpp>
+
+// OpenROAD
 #include "odb/db.h"
 #include "sta/Delay.hh"
 #include "point.h"
 
+//==============================================================================
+// Namespace Aliases
+//==============================================================================
+
 namespace bgi = boost::geometry::index;
 namespace bg = boost::geometry::model;
 
+//==============================================================================
+// Forward Declarations
+//==============================================================================
+
 namespace utl {
 class Logger;
-}  // namespace utl
+}
 
 namespace rsz {
 class Resizer;
-}  // namespace rsz
+}
 
 namespace est {
 class EstimateParasitics;
 class SteinerTree;
-}  // namespace est
+}
 
 namespace sta {
 class dbNetwork;
@@ -69,14 +81,26 @@ class GateTableModel;
 class Pvt;
 class Graph;
 class MinMax;
-}  // namespace sta
+}
+
+//==============================================================================
+// GPL Namespace
+//==============================================================================
 
 namespace gpl {
 
+//==============================================================================
+// Type Aliases
+//==============================================================================
+
 using Point = bg::point<int, 2, boost::geometry::cs::cartesian>;
 using Box = bg::box<Point>;
-using FlopClusterEntry = std::pair<Box, int>;  
+using FlopClusterEntry = std::pair<Box, int>;
 using FlopClusterRTree = bgi::rtree<FlopClusterEntry, bgi::rstar<16, 4, 4>>;
+
+//==============================================================================
+// Enumerations
+//==============================================================================
 
 enum FlopPort
 {
@@ -88,13 +112,14 @@ enum FlopPort
 //==============================================================================
 
 /**
- * @brief Represents the characteristics of an MBFF master cell
+ * @brief Master cell characteristics for flop grouping
  * 
- * Stores various pin characteristics of the master cell (Function ID, clock edge,
- * CLR, PRE, Q, QN, Scan). Used for grouping flops with the same characteristics.
+ * Encapsulates pin characteristics of the master cell (function ID, clock edge,
+ * CLR, PRE, Q, QN, Scan). Flops with identical masks can be grouped together.
  */
 struct MasterMask
 {
+  // Member variables
   int func_id_{-1};
   bool has_positive_clock_edge_{false};
   bool has_clear_{false};
@@ -103,8 +128,9 @@ struct MasterMask
   bool has_qn_pin_{false};
   bool has_scan_{false};
 
+  // Constructors
   MasterMask() = default;
-
+  
   MasterMask(int func_id,
              bool has_positive_clock_edge,
              bool has_clear,
@@ -122,6 +148,7 @@ struct MasterMask
   {
   }
 
+  // Comparison operators
   auto _tie() const
   {
     return std::tie(func_id_,
@@ -133,35 +160,32 @@ struct MasterMask
                     has_scan_);
   }
 
-  bool operator<(const MasterMask& rhs) const
-  {
-    return _tie() < rhs._tie();
-  }
+  bool operator<(const MasterMask& rhs) const { return _tie() < rhs._tie(); }
+  bool operator==(const MasterMask& rhs) const { return _tie() == rhs._tie(); }
 
-  bool operator==(const MasterMask& rhs) const
-  {
-    return _tie() == rhs._tie();
-  }
-
+  // Utilities
   std::string to_string() const;
 };
 
 /**
- * @brief Represents the net connections of a flip-flop instance
+ * @brief Instance net connections for flop grouping
  * 
- * Stores which nets the individual flip-flop instance is actually connected to
- * (CLK, CLR, PRE, SE, SI nets).
+ * Stores actual net connections for a flip-flop instance
+ * (CLK, CLR, PRE, SE, SI nets). Flops with identical connections
+ * can potentially be merged.
  */
 struct InstMask
 {
+  // Member variables
   odb::dbNet* clock_net_{nullptr};
   odb::dbNet* clear_net_{nullptr};
   odb::dbNet* preset_net_{nullptr};
   odb::dbNet* scan_enable_net_{nullptr};
   odb::dbNet* scan_in_net_{nullptr};
 
+  // Constructors
   InstMask() = default;
-
+  
   InstMask(odb::dbNet* clock_net,
            odb::dbNet* clear_net,
            odb::dbNet* preset_net,
@@ -175,6 +199,7 @@ struct InstMask
   {
   }
 
+  // Comparison operators
   auto _tie() const
   {
     return std::tie(clock_net_,
@@ -184,16 +209,10 @@ struct InstMask
                     scan_in_net_);
   }
 
-  bool operator<(const InstMask& rhs) const
-  {
-    return _tie() < rhs._tie();
-  }
+  bool operator<(const InstMask& rhs) const { return _tie() < rhs._tie(); }
+  bool operator==(const InstMask& rhs) const { return _tie() == rhs._tie(); }
 
-  bool operator==(const InstMask& rhs) const
-  {
-    return _tie() == rhs._tie();
-  }
-
+  // Utilities
   std::string to_string() const;
 };
 
@@ -202,13 +221,13 @@ struct InstMask
 //==============================================================================
 
 /**
- * @brief Timing path information between two flip-flops
+ * @brief Timing path between two flip-flops
  * 
- * Stores the timing path and slack information between the source and destination flops.
- * Used for timing constraint analysis.
+ * Encapsulates timing path and slack information for timing-driven clustering.
  */
 struct TimingPath
 {
+  // Member variables
   sta::Path* path_{nullptr};
   sta::Slack slack_{sta::INF};
   int start_flop_idx_{-1};
@@ -216,6 +235,7 @@ struct TimingPath
   odb::dbITerm* start_pin_{nullptr};  // Output pin of start flop (Q or QN)
   odb::dbITerm* end_pin_{nullptr};    // Input pin of end flop (D)
 
+  // Constructor
   TimingPath(sta::Path* path, 
              sta::Slack slack, 
              int start_idx, 
@@ -231,15 +251,13 @@ struct TimingPath
   {
   }
 
+  // Comparison operator
   auto _tie() const
   {
     return std::tie(slack_, start_flop_idx_, end_flop_idx_, start_pin_, end_pin_, path_);
   }
 
-  bool operator<(const TimingPath& other) const
-  {
-    return _tie() < other._tie();
-  }
+  bool operator<(const TimingPath& other) const { return _tie() < other._tie(); }
 };
 
 //==============================================================================
@@ -247,22 +265,18 @@ struct TimingPath
 //==============================================================================
 
 /**
- * @brief Single virtual bin for density constraint checking
+ * @brief Virtual bin for density constraint checking
  * 
- * Stores the boundary and placed area information of each virtual bin.
- * Used for checking density constraints.
+ * Represents a single bin in the virtual grid for tracking placement density.
  */
 class VirtualBin
 {
 public:
+  // Constructors
   VirtualBin() = default;
-
+  
   VirtualBin(int lx, int ly, int ux, int uy, float target_density)
-      : lx_(lx),
-        ly_(ly),
-        ux_(ux),
-        uy_(uy),
-        target_density_(target_density)
+      : lx_(lx), ly_(ly), ux_(ux), uy_(uy), target_density_(target_density)
   {
     bin_area_ = static_cast<int64_t>(ux_ - lx_) * static_cast<int64_t>(uy_ - ly_);
   }
@@ -273,6 +287,14 @@ public:
   int ux() const { return ux_; }
   int uy() const { return uy_; }
 
+  // Area query methods
+  int64_t getInstPlacedArea() const { return inst_placed_area_; }
+  int64_t getMacroPlacedArea() const { return macro_placed_area_; }
+  int64_t getNonPlaceArea() const { return non_place_area_; }
+  int64_t getOverflowArea() const;
+  int64_t getBinArea() const { return bin_area_; }
+  float getTargetDensity() const { return target_density_; }
+
   // Area update methods
   void addInstPlacedArea(int64_t area) { inst_placed_area_ += area; }
   void addMacroPlacedArea(int64_t area) { macro_placed_area_ += area; }
@@ -281,95 +303,74 @@ public:
   void subMacroPlacedArea(int64_t area) { macro_placed_area_ -= area; }
   void subNonPlaceArea(int64_t area) { non_place_area_ -= area; }
 
-  // Area getters 
-  int64_t getInstPlacedArea() const { return inst_placed_area_; }
-  int64_t getMacroPlacedArea() const { return macro_placed_area_; }
-  int64_t getNonPlaceArea() const { return non_place_area_; }
-
-  int64_t getOverflowArea() const
-  {
-    // Calculate overflow as: inst_area + macro_area*density + non_place*density - bin_area*density
-    const float result = static_cast<float>(inst_placed_area_)
-                       + static_cast<float>(macro_placed_area_) * target_density_
-                       + static_cast<float>(non_place_area_) * target_density_
-                       - static_cast<float>(bin_area_) * target_density_;
-    return static_cast<int64_t>(std::max(0.0f, result));
-  }
-
 private:
-  int lx_, ly_, ux_, uy_;
-  float target_density_;
-  int64_t bin_area_ = 0;
-  int64_t inst_placed_area_ = 0;
-  int64_t macro_placed_area_ = 0;
-  int64_t non_place_area_ = 0;
+  // Bin boundaries
+  int lx_{0}, ly_{0}, ux_{0}, uy_{0};
+  
+  // Areas
+  int64_t bin_area_{0};
+  int64_t inst_placed_area_{0};
+  int64_t macro_placed_area_{0};
+  int64_t non_place_area_{0};
+  
+  // Configuration
+  float target_density_{0.0f};
 };
 
 /**
- * @brief Virtual bin grid: manages all virtual bins in the chip area
+ * @brief Virtual bin grid for density management
  * 
- * Divides the chip area into a uniform grid and manages density information
- * of each bin. Used for checking density constraints and validating placement.
+ * Manages a uniform grid of bins covering the chip area for density checking.
  */
 class VirtualBinGrid
 {
 public:
+  // Constructors
   VirtualBinGrid() = default;
+  
+  VirtualBinGrid(int lx, int ly, int ux, int uy,
+                 int bin_cnt_x, int bin_cnt_y,
+                 double bin_size_x, double bin_size_y,
+                 float target_density, float target_overflow);
 
-  VirtualBinGrid(int lx,
-                 int ly,
-                 int ux,
-                 int uy,
-                 int bin_cnt_x,
-                 int bin_cnt_y,
-                 double bin_size_x,
-                 double bin_size_y,
-                 float target_density,
-                 float target_overflow)
-      : lx_(lx),
-        ly_(ly),
-        ux_(ux),
-        uy_(uy),
-        bin_cnt_x_(bin_cnt_x),
-        bin_cnt_y_(bin_cnt_y),
-        bin_size_x_(bin_size_x),
-        bin_size_y_(bin_size_y),
-        target_density_(target_density),
-        target_overflow_(target_overflow)
-  {
-    bins_.reserve(bin_cnt_x_ * bin_cnt_y_);
-    for (int y = 0; y < bin_cnt_y_; ++y) {
-      for (int x = 0; x < bin_cnt_x_; ++x) {
-        int bin_lx = lx_ + std::lround(x * bin_size_x_);
-        int bin_ly = ly_ + std::lround(y * bin_size_y_);
-        int bin_ux = lx_ + std::lround((x + 1) * bin_size_x_);
-        int bin_uy = ly_ + std::lround((y + 1) * bin_size_y_);
-        bins_.emplace_back(bin_lx, bin_ly, bin_ux, bin_uy, target_density_);
-      }
-    }
-  }
-
-  // Accessors
+  // Query methods
   bool checkOverflow();
+  bool wouldOverflow(odb::dbMaster* master1, const Point& pos1,
+                     odb::dbMaster* master2, const Point& pos2,
+                     odb::dbMaster* new_master, const Point& new_pos) const;
   std::vector<VirtualBin>& getBins() { return bins_; }
   std::pair<int, int> getMinMaxIdxX(const odb::Rect& box) const;
   std::pair<int, int> getMinMaxIdxY(const odb::Rect& box) const;
+  int getBinCntX() const { return bin_cnt_x_; }
+  int getBinCntY() const { return bin_cnt_y_; }
   double getBinSizeX() const { return bin_size_x_; }
   double getBinSizeY() const { return bin_size_y_; }
 
-  // Modifiers
+  // Update methods
   void addInst(odb::dbMaster* master, const Point& center_pos);
   void removeInst(odb::dbMaster* master, const Point& center_pos);
+  void applyMerge(odb::dbMaster* master1, const Point& pos1,
+                  odb::dbMaster* master2, const Point& pos2,
+                  odb::dbMaster* new_master, const Point& new_pos);
 
 private:
-  int lx_, ly_, ux_, uy_;
-  int bin_cnt_x_, bin_cnt_y_;
-  double bin_size_x_, bin_size_y_;
-  float target_density_;
-  float target_overflow_;
-  std::vector<VirtualBin> bins_;
-
+  void accumulateInstPlacement(odb::dbMaster* master, const Point& center_pos,
+                               std::vector<int64_t>& area_deltas, bool is_add) const;
   void updateInstPlacement(odb::dbMaster* master, const Point& center_pos, bool is_add);
+
+  // Grid boundaries
+  int lx_{0}, ly_{0}, ux_{0}, uy_{0};
+  
+  // Grid dimensions
+  int bin_cnt_x_{0}, bin_cnt_y_{0};
+  double bin_size_x_{0.0}, bin_size_y_{0.0};
+  
+  // Configuration
+  float target_density_{0.0f};
+  float target_overflow_{0.0f};
+  
+  // Bins
+  std::vector<VirtualBin> bins_;
 };
 
 //==============================================================================
@@ -377,17 +378,18 @@ private:
 //==============================================================================
 
 /**
- * @brief Edge between two mergeable clusters
+ * @brief Edge between mergeable clusters
  * 
- * Represents an edge between two mergeable flip-flop clusters.
- * Contains merge cost (weight) and proposed placement location after merge.
+ * Represents a potential merge between two compatible clusters.
  */
 struct Edge
 {
-  int n1, n2;           // Two FlopCluster indices
-  double weight;        // Edge weight (cost to merge)
-  FloatPoint pos;       // Proposed placement location after merging
+  // Member variables
+  int n1, n2;         // Cluster indices (n1 < n2)
+  double weight;      // Merge cost
+  FloatPoint pos;     // Proposed placement after merge
 
+  // Constructor
   Edge(int node1, int node2, double w, FloatPoint p)
       : weight(w), pos(p)
   {
@@ -395,23 +397,23 @@ struct Edge
     n2 = std::max(node1, node2);
   }
 
+  // Comparison operators
   auto _tie() const { return std::tie(weight, n1, n2, pos.x, pos.y); }
-
   bool operator<(const Edge& other) const { return _tie() < other._tie(); }
   bool operator==(const Edge& other) const { return _tie() == other._tie(); }
 };
 
 /**
- * @brief Hash function for Edge
- * 
- * Hash function to use edges as keys in unordered_set/unordered_map.
+ * @brief Hash functor for Edge
  */
 struct EdgeHash
 {
   std::size_t operator()(const Edge& e) const
   {
-    return std::hash<int>{}(e.n1) ^ (std::hash<int>{}(e.n2) << 1)
-           ^ (std::hash<double>{}(e.weight) << 2) ^ (FloatPoint::Hash{}(e.pos) << 3);
+    return std::hash<int>{}(e.n1) 
+         ^ (std::hash<int>{}(e.n2) << 1)
+         ^ (std::hash<double>{}(e.weight) << 2) 
+         ^ (FloatPoint::Hash{}(e.pos) << 3);
   }
 };
 
@@ -533,9 +535,9 @@ struct FlopUnit
            const InstMask& inst_mask)
       : id_(id),
         inst_(inst),
-        cluster_idx_(-1),
         master_mask_(master_mask),
-        inst_mask_(inst_mask)
+        inst_mask_(inst_mask),
+        cluster_idx_(-1)
   {
     orig_pt_.x = curr_pt_.x = static_cast<float>(bbox.xCenter());
     orig_pt_.y = curr_pt_.y = static_cast<float>(bbox.yCenter());
@@ -572,10 +574,10 @@ struct FlopCluster
   // Constructor from a single FlopUnit
   FlopCluster(int id, const FlopUnit& flop_unit)
       : id_(id),
-        curr_pt_(flop_unit.curr_pt_),
-        feasible_region_(flop_unit.feasible_region_),
         master_mask_(flop_unit.master_mask_),
-        inst_mask_(flop_unit.inst_mask_)
+        inst_mask_(flop_unit.inst_mask_),
+        curr_pt_(flop_unit.curr_pt_),
+        feasible_region_(flop_unit.feasible_region_)
   {
     flops_.insert(flop_unit.id_);
   }
@@ -606,282 +608,256 @@ struct FlopCluster
 //==============================================================================
 
 /**
- * @brief Merge-based flip-flop clustering engine
+ * @brief Hierarchical flip-flop clustering engine for MBFF synthesis
  * 
- * Hierarchically merges compatible flops to convert them into multi-bit flip-flops (MBFFs).
- * Performs optimal clustering considering timing constraints, density constraints, and energy efficiency.
+ * Converts single-bit flip-flops into multi-bit flip-flops (MBFFs) through
+ * agglomerative clustering, optimizing for timing, density, and power.
  *
- * Algorithm Flow:
- * 1. Initialize virtual bin grid for density checking
- * 2. Read compatible masters from liberty library
- * 3. Read flip-flop instances and create flop units
- * 4. Create compatible groups based on masks
- * 5. Read timing paths from STA
- * 6. Analyze timing paths and compute slack budgets
- * 7. Calculate feasible regions for each flop unit
- * 8. Initialize flop clusters (one per flop)
- * 9. Create compatibility graph (edges between mergeable clusters)
- * 10. Run agglomerative clustering (greedily merge clusters)
- * 11. Implement final clusters by creating MBFF instances
+ * Algorithm Overview:
+ * 1. Initialize density-aware virtual bin grid
+ * 2. Read compatible MBFF masters from Liberty
+ * 3. Extract flip-flop instances and create flop units
+ * 4. Group compatible flops by masks
+ * 5. Extract timing paths from STA
+ * 6. Analyze timing and compute slack budgets
+ * 7. Calculate feasible placement regions
+ * 8. Initialize single-flop clusters
+ * 9. Build compatibility graph with merge candidates
+ * 10. Greedily merge clusters by cost
+ * 11. Implement final clusters as MBFF instances
  */
 class AggloCluster
 {
-  public:
-    AggloCluster(odb::dbDatabase* db,
-                 sta::dbSta* sta,
-                 utl::Logger* log,
-                 rsz::Resizer* resizer,
-                 float target_density,
-                 float target_overflow,
-                 int num_paths_per_endpoint,
-                 int threads,
-                 float feasible_region_bin_multiplier = 3.0f,
-                 bool verbose = true);
-    ~AggloCluster();
+public:
+  // Constructor & Destructor
+  AggloCluster(odb::dbDatabase* db,
+               sta::dbSta* sta,
+               utl::Logger* log,
+               rsz::Resizer* resizer,
+               float target_density,
+               float target_overflow,
+               float region_scale_factor,
+               int num_paths_per_endpoint,
+               int threads,
+               int num_samples,
+               bool verbose);
+  ~AggloCluster();
 
-    // Main clustering flow
-    void doAggloCluster();
+  // Main entry point
+  void doAggloCluster();
 
-  private:
-    //========================================================================
-    // External References (OpenROAD)
-    //========================================================================
-    odb::dbDatabase* db_;
-    odb::dbBlock* block_;
-    sta::dbSta* sta_;
-    sta::dbNetwork* network_;
-    sta::Corner* corner_;
-    rsz::Resizer* resizer_;
-    utl::Logger* log_;
+private:
+  //==========================================================================
+  // External References
+  //==========================================================================
+  
+  odb::dbDatabase* db_;
+  odb::dbBlock* block_;
+  sta::dbSta* sta_;
+  sta::dbNetwork* network_;
+  sta::Corner* corner_;
+  rsz::Resizer* resizer_;
+  utl::Logger* log_;
 
-    //========================================================================
-    // Configuration Parameters
-    //========================================================================
-    int threads_;
-    int num_paths_per_endpoint_; // Number of timing paths to consider per flop endpoint
-    float target_density_;
-    float target_overflow_;
-    float feasible_region_bin_multiplier_; // Feasible region upper bound = bin_size * k
-    bool verbose_;
+  //==========================================================================
+  // Configuration
+  //==========================================================================
+  
+  // Parallelization
+  int threads_;
+  
+  // Timing analysis
+  int num_paths_per_endpoint_;
+  
+  // Density constraints
+  float target_density_;
+  float target_overflow_;
+  
+  // Feasible region constraint
+  float region_scale_factor_;
+  
+  // Debug & output
+  int num_samples_;
+  bool verbose_;
 
-    //========================================================================
-    // Master & Compatibility Information
-    //========================================================================
-    // Key: MasterMask, Value: map of (bit-width -> vector of compatible dbMasters)
-    std::map<MasterMask, std::map<int, std::vector<odb::dbMaster*>>> compatible_masters_;
-    // Key: MasterMask, Value: map of (bit-width -> largest compatible dbMaster)
-    std::map<MasterMask, std::map<int, odb::dbMaster*>> representative_masters_;
-    // Key: (MasterMask, InstMask), Value: indices of compatible FlopUnits
-    std::map<std::pair<MasterMask, InstMask>, std::vector<int>> compatible_groups_;
+  //==========================================================================
+  // Data Structures
+  //==========================================================================
+  
+  // Flop & cluster data
+  std::vector<FlopUnit> flop_units_;
+  std::vector<FlopCluster> flop_clusters_;
+  std::vector<bool> flop_cluster_is_valid_;
+  std::vector<bool> flop_cluster_no_further_merge_;
+  
+  // Timing information
+  std::vector<TimingPath> timing_paths_;
+  
+  // Master & compatibility mappings
+  std::map<MasterMask, std::map<int, std::vector<odb::dbMaster*>>> compatible_masters_;
+  std::map<MasterMask, std::map<int, odb::dbMaster*>> representative_masters_;
+  std::map<std::pair<MasterMask, InstMask>, std::vector<int>> compatible_groups_;
+  
+  // Compatibility graph
+  std::set<Edge> edge_pq_;
+  std::unordered_map<int, std::unordered_set<Edge, EdgeHash>> adj_list_;
+  FlopClusterRTree feasible_regions_;
+  
+  // Helper mappings
+  std::unordered_map<std::string, int> func_str_to_func_id_;
+  std::unordered_map<odb::dbInst*, int> inst_to_flop_id_;
+  
+  // Spatial grid
+  VirtualBinGrid virtual_bin_grid_;
 
-    //========================================================================
-    // Flop & Cluster Data
-    //========================================================================
-    std::vector<FlopUnit> flop_units_;
-    std::vector<FlopCluster> flop_clusters_;
-    std::vector<bool> flop_cluster_is_valid_;
-    std::vector<bool> flop_cluster_no_further_merge_;
+  //==========================================================================
+  // Main Algorithm Pipeline
+  //==========================================================================
+  
+  void initVirtualBinGrid();
+  void readCompatibleMasters();
+  void readFlopUnits();
+  void readTimingPaths();
+  void createCompatibleGroups();
+  void analyzeTimingPaths();
+  void calcFeasibleRegions();
+  void createFlopClusters();
+  void createCompatibilityGraph();
+  void runAgglomerativeClustering();
+  void implementClusters();
 
-    //========================================================================
-    // Timing Information
-    //========================================================================
-    std::vector<TimingPath> timing_paths_;
+  //==========================================================================
+  // Helper Functions
+  //==========================================================================
 
-    //========================================================================
-    // Compatibility Graph (for Agglomerative Clustering)
-    //========================================================================
-    std::set<Edge> edge_pq_; // Priority queue of mergeable edges (sorted by weight)
-    std::unordered_map<int, std::unordered_set<Edge, EdgeHash>> adj_list_; // Adjacency list: Key=FlopCluster index, Value=edges connected to it
-    FlopClusterRTree feasible_regions_; // R-Tree for fast spatial queries on feasible regions (45-degree transformed)
+  // --- Phase 1: Virtual Bin Grid Initialization ---
+  
+  void populateBinGrid();
 
-    //========================================================================
-    // Helper Mappings & Spatial Grid
-    //========================================================================
-    std::unordered_map<std::string, int> func_str_to_func_id_;
-    std::unordered_map<odb::dbInst*, int> inst_to_flop_id_;
-    VirtualBinGrid virtual_bin_grid_;
+  // --- Phase 2-3: Master & Flop Analysis ---
+  
+  bool isValidFlop(odb::dbInst* inst) const;
+  InstMask createInstMask(odb::dbInst* inst);
+  MasterMask createMasterMask(odb::dbInst* inst);
+  
+  const sta::LibertyCell* getLibertyCell(odb::dbInst* inst) const;
+  int getFuncId(const sta::FuncExpr* expr, odb::dbInst* inst);
+  std::string getFuncStr(const sta::FuncExpr* expr, odb::dbInst* inst) const;
+  
+  bool hasClear(odb::dbInst* inst) const;
+  bool hasPreset(odb::dbInst* inst) const;
+  bool hasPositiveClockEdge(odb::dbInst* inst) const;
+  bool hasScan(odb::dbInst* inst) const;
+  
+  int getNumDPins(odb::dbInst* inst) const;
+  int getNumQPins(odb::dbInst* inst) const;
+  int getNumQNPins(odb::dbInst* inst) const;
+  
+  bool isClockPin(odb::dbITerm* iterm) const;
+  bool isDPin(odb::dbITerm* iterm) const;
+  bool isQPin(odb::dbITerm* iterm) const;
+  bool isQNPin(odb::dbITerm* iterm) const;
+  bool isClearPin(odb::dbITerm* iterm) const;
+  bool isPresetPin(odb::dbITerm* iterm) const;
+  bool isPowerPin(odb::dbITerm* iterm) const;
+  bool isScanEnablePin(odb::dbITerm* iterm) const;
+  bool isScanInPin(odb::dbITerm* iterm) const;
+  
+  const sta::LibertyPort* getLibertyPort(odb::dbITerm* iterm) const;
+  const sta::FuncExpr* getPortFunc(const sta::LibertyPort* port) const;
+  FlopPort getPortType(const sta::LibertyPort* lib_port, odb::dbInst* inst) const;
 
-    //========================================================================
-    // Main Algorithm Steps (in execution order)
-    //========================================================================
-    
-    // ---- Initialization & Data Collection ----
-    void initVirtualBinGrid();           // Initialize virtual bin grid for density checking
-    void readCompatibleMasters();        // Read compatible MBFF masters from Liberty
-    void readFlopUnits();                // Read flip-flop instances and create FlopUnits
-    void readTimingPaths();              // Extract timing paths from STA
-    
-    // ---- Grouping & Analysis ----
-    void createCompatibleGroups();       // Group flops by (MasterMask, InstMask)
-    void analyzeTimingPaths();           // Compute slack budgets for each pin
-    void calcFeasibleRegions();          // Calculate feasible regions from slack budgets
-    
-    // ---- Graph Construction ----
-    void createFlopClusters();           // Initialize clusters (one per flop)
-    void createCompatibilityGraph();     // Build graph with mergeable cluster edges
-    
-    // ---- Clustering & Implementation ----
-    void runAgglomerativeClustering();   // Greedily merge clusters by edge weights
-    void implementClusters();            // Convert final clusters into MBFF instances
+  // --- Phase 7: Feasible Region Calculation ---
+  
+  void calcFeasibleRegion(FlopUnit& flop, bool verbose = false);
+  void processFanOutPin(FlopUnit& flop, odb::dbITerm* out_pin, odb::dbMTerm* clk_pin_lib,
+                        est::EstimateParasitics* est, double unit_r, double unit_c, bool verbose = false);
+  void processFanInPin(FlopUnit& flop, odb::dbITerm* in_pin, 
+                       est::EstimateParasitics* est, double unit_r, double unit_c, bool verbose = false);
+  void computeFinalFeasibleRegion(FlopUnit& flop, const std::vector<odb::dbITerm*>& all_pins, bool verbose = false);
+  
+  float getPinCapacitance(const sta::Pin* pin) const;
+  std::vector<std::pair<float, float>> extractCapacitanceDelayPoints(odb::dbInst* inst,
+      const std::string& input_pin_name, const std::string& output_pin_name, float input_slew) const;
+  std::vector<std::pair<odb::dbITerm*, float>> getInstanceInputSlews(odb::dbInst* inst) const;
+  bool findSteinerPathRecursive(est::SteinerTree* tree, int current_pt, int target_pt, std::vector<int>& path);
+  
+  float solveMaxDistanceFanOut(float l1, float unit_r, float unit_c, float slack_budget,
+                               float coeff, float wo_fst_stt_cap, bool verbose = false) const;
+  float solveMaxDistanceFanIn(float l1, float unit_r, float unit_c, float slack_budget,
+                              float coeff, float on_path_R_wo_last, float ipin_cap, bool verbose = false) const;
+  Box createFeasibleBox(int steiner_x, int steiner_y, float max_dist) const;
+  
+  bool findTimingArcModel(const sta::LibertyCell* liberty_cell, const std::string& input_pin_name,
+      const std::string& output_pin_name, const sta::TableAxis*& capacitance_axis, 
+      sta::GateTableModel*& timing_model) const;
+  bool findCapacitanceAxis(sta::GateTableModel* gate_model, const sta::TableAxis*& capacitance_axis) const;
+  float calculateGateDelay(sta::GateTableModel* timing_model, const sta::Pvt* pvt_conditions,
+                           float input_slew, float output_capacitance) const;
+  float getTerminalSlew(odb::dbITerm* terminal, sta::Graph* timing_graph, const sta::MinMax* min_max) const;
 
-    //========================================================================
-    // Helper Functions (grouped by algorithm phase, organized by hierarchy)
-    //========================================================================
+  // --- Phase 9: Compatibility Graph Construction ---
+  
+  std::vector<Edge> updateEdges(const FlopCluster& cluster, bool verbose = false);
+  std::vector<FlopClusterEntry> getIntersectedCluster(const FlopCluster& cluster, bool verbose = false) const;
+  bool checkCompatibility(const FlopCluster& c1, const FlopCluster& c2, bool verbose = false) const;
+  odb::dbMaster* getClusterMaster(const FlopCluster& cluster) const;
+  PlacementCandidate calcPlacementCandidate(const FlopCluster& c1, const FlopCluster& c2, bool verbose = false);
+  
+  Box calcMedianBox(const FlopCluster& c1, const FlopCluster& c2) const;
+  Box getFeasibleRegionIntersection(const FlopCluster& c1, const FlopCluster& c2) const;
+  Point project(const Box& hpwl_box, const Box& feasible_box) const;
+  std::vector<Point> generateUniformSamples(const Box& box, int p) const;
+  bool checkPlacementDensityConstraint(const FlopCluster& c1, odb::dbMaster* master1,
+                                       const FlopCluster& c2, odb::dbMaster* master2,
+                                       const Point& new_pos, odb::dbMaster* new_master);
+  double calcMergeHPWLGain(const FlopCluster& c1, const FlopCluster& c2,
+                           const FloatPoint& merge_position, bool verbose = false) const;
+  std::set<std::variant<odb::dbITerm*, odb::dbBTerm*>> getConnectedPins(const FlopCluster& cluster) const;
+  FloatPoint getPinCoordinate(const std::variant<odb::dbITerm*, odb::dbBTerm*>& pin_variant) const;
 
-    // ╔═══════════════════════════════════════════════════════════════════╗
-    // ║ Phase 2-3: readCompatibleMasters() & readFlopUnits()              ║
-    // ╚═══════════════════════════════════════════════════════════════════╝
-    
-    // [Level 1] Flop validation
-    bool isValidFlop(odb::dbInst* inst) const;
-    
-    // [Level 1] Mask creation (top-level)
-    InstMask createInstMask(odb::dbInst* inst);
-    MasterMask createMasterMask(odb::dbInst* inst);
-    
-    // [Level 2] Liberty cell and function analysis
-    const sta::LibertyCell* getLibertyCell(odb::dbInst* inst) const;
-    int getFuncId(const sta::FuncExpr* expr, odb::dbInst* inst);
-    std::string getFuncStr(const sta::FuncExpr* expr, odb::dbInst* inst) const;
-    
-    // [Level 2] Master property checkers
-    bool hasClear(odb::dbInst* inst) const;
-    bool hasPreset(odb::dbInst* inst) const;
-    bool hasPositiveClockEdge(odb::dbInst* inst) const;
-    bool hasScan(odb::dbInst* inst) const;
-    
-    // [Level 2] Pin counting utilities
-    int getNumDPins(odb::dbInst* inst) const;
-    int getNumQPins(odb::dbInst* inst) const;
-    int getNumQNPins(odb::dbInst* inst) const;
-    
-    // [Level 3] Pin type checkers (used by mask creation and validation)
-    bool isClockPin(odb::dbITerm* iterm) const;
-    bool isDPin(odb::dbITerm* iterm) const;
-    bool isQPin(odb::dbITerm* iterm) const;
-    bool isQNPin(odb::dbITerm* iterm) const;
-    bool isClearPin(odb::dbITerm* iterm) const;
-    bool isPresetPin(odb::dbITerm* iterm) const;
-    bool isPowerPin(odb::dbITerm* iterm) const;
-    bool isScanEnablePin(odb::dbITerm* iterm) const;
-    bool isScanInPin(odb::dbITerm* iterm) const;
-    
-    // [Level 3] Port analysis utilities
-    const sta::LibertyPort* getLibertyPort(odb::dbITerm* iterm) const;
-    const sta::FuncExpr* getPortFunc(const sta::LibertyPort* port) const;
-    FlopPort getPortType(const sta::LibertyPort* lib_port, odb::dbInst* inst) const;
+  // --- Phase 10: Agglomerative Clustering ---
+  
+  int mergeClusters(const Edge& merge_edge, bool verbose = false);
+  bool isFurtherMergeable(const FlopCluster& cluster, bool verbose = false) const;
+  void removeEdges(const FlopCluster& cluster, bool verbose = false);
+  std::set<int> distributeSlack(const FlopCluster& cluster, bool verbose = false);
+  void updateFeasibleRegion(FlopCluster& cluster, bool verbose = false);
+  
+  std::unordered_map<odb::dbITerm*, std::vector<std::pair<int, sta::Slack>>>
+  calcUsedSlacks(const FlopUnit& flop, bool verbose = false);
+  void calcUsedSlacksFanOut(const FlopUnit& flop, odb::dbITerm* out_pin, odb::dbMTerm* clk_pin_lib,
+      est::EstimateParasitics* est, double unit_r, double unit_c,
+      std::unordered_map<odb::dbITerm*, std::vector<std::pair<int, sta::Slack>>>& used_slacks, bool verbose = false);
+  void calcUsedSlacksFanIn(const FlopUnit& flop, odb::dbITerm* d_pin,
+      est::EstimateParasitics* est, double unit_r, double unit_c,
+      std::unordered_map<odb::dbITerm*, std::vector<std::pair<int, sta::Slack>>>& used_slacks, bool verbose = false);
 
-    // ╔═══════════════════════════════════════════════════════════════════╗
-    // ║ Phase 7: calcFeasibleRegions()                                    ║
-    // ╚═══════════════════════════════════════════════════════════════════╝
-    
-    // [Level 1] Top-level: Compute feasible region for each flop unit
-    void calcFeasibleRegion(FlopUnit& flop, bool verbose = false);
-    
-    // [Level 2] Main processing functions for different pin types
-    void processFanOutPin(FlopUnit& flop, odb::dbITerm* out_pin, odb::dbMTerm* clk_pin_lib, est::EstimateParasitics* est, double unit_r, double unit_c, bool verbose = false);
-    void processFanInPin(FlopUnit& flop, odb::dbITerm* in_pin, est::EstimateParasitics* est, double unit_r, double unit_c, bool verbose = false);
-    void computeFinalFeasibleRegion(FlopUnit& flop, const std::vector<odb::dbITerm*>& all_pins, bool verbose = false);
-    
-    // [Level 3] Utility functions for timing and parasitic analysis
-    float getPinCapacitance(const sta::Pin* pin) const;
-    std::vector<std::pair<float, float>> extractCapacitanceDelayPoints(odb::dbInst* inst, const std::string& input_pin_name, const std::string& output_pin_name, float input_slew) const;
-    std::vector<std::pair<odb::dbITerm*, float>> getInstanceInputSlews(odb::dbInst* inst) const;
-    bool findSteinerPathRecursive(est::SteinerTree* tree, int current_pt, int target_pt, std::vector<int>& path);
-    
-    // [Level 3] Quadratic equation solving for max distance calculation
-    float solveMaxDistanceFanOut(float l1, float unit_r, float unit_c, float slack_budget, float coeff, float wo_fst_stt_cap, bool verbose = false) const;
-    float solveMaxDistanceFanIn(float l1, float unit_r, float unit_c, float slack_budget, float coeff, float on_path_R_wo_last, float ipin_cap, bool verbose = false) const;
-    Box createFeasibleBox(int steiner_x, int steiner_y, float max_dist) const;
-    
-    // [Level 4] Helper functions for extractCapacitanceDelayPoints
-    bool findTimingArcModel(const sta::LibertyCell* liberty_cell, const std::string& input_pin_name, const std::string& output_pin_name, const sta::TableAxis*& capacitance_axis, sta::GateTableModel*& timing_model) const;
-    bool findCapacitanceAxis(sta::GateTableModel* gate_model, const sta::TableAxis*& capacitance_axis) const;
-    float calculateGateDelay(sta::GateTableModel* timing_model, const sta::Pvt* pvt_conditions, float input_slew, float output_capacitance) const;
-    
-    // [Level 4] Helper function for getInstanceInputSlews
-    float getTerminalSlew(odb::dbITerm* terminal, sta::Graph* timing_graph, const sta::MinMax* min_max) const;
+  // --- Phase 11: MBFF Implementation ---
+  
+  bool implementSingleCluster(const FlopCluster& cluster, bool verbose = false, int debug_idx = -1);
+  std::vector<NetBundle> getNetBundles(const FlopCluster& cluster) const;
+  std::map<odb::dbMaster*, std::vector<PortBundle>> getAllPortBundles(
+      const FlopCluster& cluster, const std::vector<NetBundle>& net_bundles) const;
+  MasterPortAssignment assignPorts(const FlopCluster& cluster,
+                                   const std::vector<NetBundle>& net_bundles,
+                                   const std::map<odb::dbMaster*, std::vector<PortBundle>>& master_port_bundles);
+  void applyImplementation(const FlopCluster& cluster, const MasterPortAssignment& result,
+                           const std::vector<NetBundle>& net_bundles);
+  double calcAssignmentCost(const NetBundle& net_bundle, const PortBundle& port_bundle,
+                            odb::dbMaster* master, const Point& new_inst_origin) const;
+  odb::Rect getNetBBoxWithoutPin(odb::dbNet* net, odb::dbITerm* pin_to_ignore) const;
+  Point getGlobalMTermPos(const Point& local_port_pos, odb::dbMaster* master, const Point& inst_center) const;
+  std::vector<PortBundle> getPortBundles(odb::dbMaster* master) const;
 
-    // ╔═══════════════════════════════════════════════════════════════════╗
-    // ║ Phase 9: createCompatibilityGraph()                              ║
-    // ╚═══════════════════════════════════════════════════════════════════╝
-    
-    // [Level 1] Top-level: Build/update compatibility graph edges
-    void updateEdges(const FlopCluster& cluster, bool verbose = false);
-    
-    // [Level 2] Main logic for edge creation
-    std::vector<FlopClusterEntry> getIntersectedCluster(const FlopCluster& cluster, bool verbose = false) const;
-    bool checkCompatibility(const FlopCluster& c1, const FlopCluster& c2, bool verbose = false) const;
-    PlacementCandidate calcPlacementCandidate(const FlopCluster& c1, const FlopCluster& c2, bool verbose = false);
-    
-    //   [Level 3] Helpers for placement candidate calculation
-    Box calcMedianBox(const FlopCluster& c1, const FlopCluster& c2) const;
-    Box getFeasibleRegionIntersection(const FlopCluster& c1, const FlopCluster& c2) const;
-    Point project(const Box& hpwl_box, const Box& feasible_box) const;
-    std::vector<Point> generateUniformSamples(const Box& box, int p) const;
-    bool checkPlacementDensityConstraint(const FlopCluster& c1, odb::dbMaster* master1, 
-                                          const FlopCluster& c2, odb::dbMaster* master2, 
-                                          const Point& new_pos, odb::dbMaster* new_master);
-    double calcMergeHPWLGain(const FlopCluster& c1, const FlopCluster& c2, 
-                             const FloatPoint& merge_position, bool verbose = false) const;
-
-    //     [Level 4] Lower-level helpers
-    std::set<std::variant<odb::dbITerm*, odb::dbBTerm*>> getConnectedPins(const FlopCluster& cluster) const;
-    FloatPoint getPinCoordinate(const std::variant<odb::dbITerm*, odb::dbBTerm*>& pin_variant) const;
-
-    // ╔═══════════════════════════════════════════════════════════════════╗
-    // ║ Phase 10: runAgglomerativeClustering()                           ║
-    // ╚═══════════════════════════════════════════════════════════════════╝
-    
-    // [Level 1] Top-level: Execute merge operations and maintain graph
-    int mergeClusters(const Edge& merge_edge, bool verbose = false);
-    bool isFurtherMergeable(const FlopCluster& cluster, bool verbose = false) const;
-    void removeEdges(const FlopCluster& cluster, bool verbose = false);
-    std::set<int> distributeSlack(const FlopCluster& cluster, bool verbose = false);
-    void updateFeasibleRegion(FlopCluster& cluster, bool verbose = false);
-    
-    // [Level 2] Reverse engineering: Calculate used slacks from actual movement
-    std::unordered_map<odb::dbITerm*, std::vector<std::pair<int, sta::Slack>>> 
-    calcUsedSlacks(const FlopUnit& flop, bool verbose = false);
-    void calcUsedSlacksFanOut(const FlopUnit& flop, odb::dbITerm* out_pin, odb::dbMTerm* clk_pin_lib, est::EstimateParasitics* est, double unit_r, double unit_c, std::unordered_map<odb::dbITerm*, std::vector<std::pair<int, sta::Slack>>>& used_slacks, bool verbose = false);
-    void calcUsedSlacksFanIn(const FlopUnit& flop, odb::dbITerm* d_pin, est::EstimateParasitics* est, double unit_r, double unit_c, std::unordered_map<odb::dbITerm*, std::vector<std::pair<int, sta::Slack>>>& used_slacks, bool verbose = false);
-
-    // ╔═══════════════════════════════════════════════════════════════════╗
-    // ║ Phase 11: implementClusters()                                    ║
-    // ╚═══════════════════════════════════════════════════════════════════╝
-    
-    // [Level 1] Top-level: Convert clusters to MBFF instances
-    bool implementSingleCluster(const FlopCluster& cluster, bool verbose = false, int debug_idx = -1);
-    
-    // [Level 2] Helpers for master selection and port assignment
-    std::vector<NetBundle> getNetBundles(const FlopCluster& cluster) const;
-    std::map<odb::dbMaster*, std::vector<PortBundle>> getAllPortBundles(const FlopCluster& cluster, const std::vector<NetBundle>& net_bundles) const;
-    MasterPortAssignment assignPorts(const FlopCluster& cluster, 
-                                     const std::vector<NetBundle>& net_bundles,
-                                     const std::map<odb::dbMaster*, std::vector<PortBundle>>& master_port_bundles);
-    void applyImplementation(const FlopCluster& cluster, const MasterPortAssignment& result, const std::vector<NetBundle>& net_bundles);
-                                     
-    // [Level 3] Lower-level helpers for implementation
-    double calcAssignmentCost(const NetBundle& net_bundle, const PortBundle& port_bundle, odb::dbMaster* master, const Point& new_inst_origin) const;
-    odb::Rect getNetBBoxWithoutPin(odb::dbNet* net, odb::dbITerm* pin_to_ignore) const;
-    Point getGlobalMTermPos(const Point& local_port_pos, odb::dbMaster* master, const Point& inst_center) const;
-    std::vector<PortBundle> getPortBundles(odb::dbMaster* master) const;
-
-    // ╔═══════════════════════════════════════════════════════════════════╗
-    // ║ General Utilities (used across multiple phases)                   ║
-    // ╚═══════════════════════════════════════════════════════════════════╝
-
-    // Unit conversion
-    double dbuToMeters(int dist) const;
-    int metersToDbu(double dist) const;
-
-    // Coordinate transformation
-    Point transformCoords(const Point& p) const;
-    Point inverseTransformCoords(const Point& p) const;
-    
-    // Math utilities
-    unsigned int roundDownToPowerOfTwo(unsigned int x);
-
+  // --- General Utilities ---
+  
+  double dbuToMeters(int dist) const;
+  int metersToDbu(double dist) const;
+  Point transformCoords(const Point& p) const;
+  Point inverseTransformCoords(const Point& p) const;
+  unsigned int roundDownToPowerOfTwo(unsigned int x);
+  int64_t computeTotalHpwl() const;
 };
 
 }  // namespace gpl

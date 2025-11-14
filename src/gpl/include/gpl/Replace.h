@@ -64,10 +64,12 @@ class Replace
 
 // -----------------------------------------------------------------------
   
-  void doClusterFlipFlops(int num_paths_per_endpoint,
-                          float density,
+  void doClusterFlipFlops(float density,
                           float overflow,
+                          float region_scale_factor,
+                          int num_paths_per_endpoint,
                           int threads,
+                          int num_samples,
                           bool debug);
 
 // -----------------------------------------------------------------------

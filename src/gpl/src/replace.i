@@ -31,15 +31,17 @@ using gpl::Replace;
 // -----------------------------------------------------------------------
 
 void 
-replace_run_cluster_flip_flops_cmd(int num_paths_per_endpoint,
-                                 float density,
+replace_run_cluster_flip_flops_cmd(float density,
                                  float overflow,
+                                 float region_scale_factor,
+                                 int num_paths_per_endpoint,
+                                 int num_samples,
                                  bool debug)
 {
-Replace* replace = getReplace();
-int threads = ord::OpenRoad::openRoad()->getThreadCount();
+  Replace* replace = getReplace();
+  int threads = ord::OpenRoad::openRoad()->getThreadCount();
   replace->doClusterFlipFlops(
-      num_paths_per_endpoint, density, overflow, threads, debug);
+      density, overflow, region_scale_factor, num_paths_per_endpoint, threads, num_samples, debug);
 }
 
 // -----------------------------------------------------------------------
