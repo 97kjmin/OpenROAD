@@ -3817,12 +3817,12 @@ AggloCluster::solveMaxDistanceFanOut(float l1,
 {
   // Step 1: Build quadratic equation coefficients
   // Solve: a*x^2 + b*x + c = 0 where x is new Manhattan distance (meters)
-  const auto a = unit_r * unit_c;
-  const auto b = wo_fst_stt_cap * unit_r + coeff * unit_c;
-  const auto c = -std::pow(l1, 2) * unit_r * unit_c 
+  const auto a = unit_r * unit_c / 2;
+  const auto b = wo_fst_stt_cap * unit_r + coeff * unit_c / 2;
+  const auto c = -std::pow(l1, 2) * unit_r * unit_c / 2 
                  - slack_budget 
                  - wo_fst_stt_cap * l1 * unit_r 
-                 - coeff * l1 * unit_c;
+                 - coeff * l1 * unit_c / 2;
   
   // Step 2: Calculate discriminant
   const float D = std::pow(b, 2) - 4 * a * c;
@@ -3878,11 +3878,11 @@ AggloCluster::solveMaxDistanceFanIn(float l1,
 {
   // Step 1: Build quadratic equation coefficients for Fan-In case
   // Solve: a*x^2 + b*x + c = 0 where x is new Manhattan distance (meters)
-  const auto a = unit_r * unit_c;
+  const auto a = unit_r * unit_c / 2;
   const auto b = on_path_R_wo_last * unit_c + coeff * unit_c + unit_r * ipin_cap;
-  const auto c = -pow(l1, 2) * unit_r * unit_c 
+  const auto c = -pow(l1, 2) * unit_r * unit_c / 2 
                  - on_path_R_wo_last * unit_c * l1 
-                 - coeff * l1 * unit_c 
+                 - coeff * l1 * unit_c / 2 
                  - ipin_cap * l1 * unit_r
                  - slack_budget;
   
@@ -5350,9 +5350,9 @@ AggloCluster::calcUsedSlacksFanOut(
       }
     }
     
-    const float rc_delay = (actual_dist * actual_dist - l1 * l1) * unit_r * unit_c;
+    const float rc_delay = (actual_dist * actual_dist - l1 * l1) * unit_r * unit_c / 2;
     const float wire_delay = (actual_dist - l1) * wo_fst_stt_cap * unit_r;
-    const float cell_delay = coeff * (actual_dist - l1) * unit_c;
+    const float cell_delay = coeff * (actual_dist - l1) * unit_c / 2;
     const sta::Slack used_slack = rc_delay + wire_delay + cell_delay;
     
     pin_used_slacks.emplace_back(path_idx, used_slack);
@@ -5542,7 +5542,7 @@ AggloCluster::calcUsedSlacksFanIn(
       }
     }
     
-    const float rc_delay = (actual_dist * actual_dist - l1 * l1) * unit_r * unit_c;
+    const float rc_delay = (actual_dist * actual_dist - l1 * l1) * unit_r * unit_c / 2;
     const float on_path_delay = (actual_dist - l1) * on_path_R_wo_last * unit_c;
     const float cell_delay = coeff * (actual_dist - l1) * unit_c;
     const float ipin_delay = (actual_dist - l1) * unit_r * ipin_cap;
