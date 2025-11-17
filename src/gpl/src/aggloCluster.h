@@ -571,6 +571,18 @@ struct FlopCluster
   // Timing Constraints
   Box feasible_region_;                   // Intersection of all member flops' regions
 
+  // Performance Cache (for faster HPWL calculation)
+  mutable std::set<odb::dbNet*> connected_nets_;                           // All nets connected to this cluster
+  mutable std::map<odb::dbNet*, std::vector<std::pair<int, int>>> external_pins_cache_;  // External pin coordinates per net
+  mutable bool cache_valid_{false};                                        // Cache validity flag
+  mutable odb::dbMaster* cached_master_{nullptr};                          // Cached master for this cluster
+
+  // Cache management
+  void invalidateCache() const { 
+    cache_valid_ = false; 
+    cached_master_ = nullptr;
+  }
+
   // Constructor from a single FlopUnit
   FlopCluster(int id, const FlopUnit& flop_unit)
       : id_(id),
@@ -590,7 +602,8 @@ struct FlopCluster
       : id_(id),
         master_mask_(c1.master_mask_),    // c1 and c2 have same masks
         inst_mask_(c1.inst_mask_),        // c1 and c2 have same masks
-        curr_pt_(edge.pos)
+        curr_pt_(edge.pos),
+        cache_valid_(false)               // Cache needs rebuild after merge
   {
     // Compute feasible region as intersection of c1 and c2 feasible regions
     boost::geometry::intersection(c1.feasible_region_,
@@ -698,10 +711,27 @@ private:
   std::map<MasterMask, std::map<int, odb::dbMaster*>> representative_masters_;
   std::map<std::pair<MasterMask, InstMask>, std::vector<int>> compatible_groups_;
   
+  // Spatial indexing structures
+  struct GridCell {
+    int x;
+    int y;
+    bool operator==(const GridCell& other) const { return x == other.x && y == other.y; }
+  };
+  
+  struct GridCellHash {
+    std::size_t operator()(const GridCell& cell) const {
+      return std::hash<int>()(cell.x) ^ (std::hash<int>()(cell.y) << 1);
+    }
+  };
+
   // Compatibility graph
   std::set<Edge> edge_pq_;
   std::unordered_map<int, std::unordered_set<Edge, EdgeHash>> adj_list_;
   FlopClusterRTree feasible_regions_;
+  
+  // Grid-based spatial hash for fast intersection queries
+  std::unordered_map<GridCell, std::vector<int>, GridCellHash> cluster_spatial_grid_;
+  int grid_cell_size_;  // Cell size in DBU
   
   // Helper mappings
   std::unordered_map<std::string, int> func_str_to_func_id_;
@@ -798,8 +828,19 @@ private:
 
   // --- Phase 9: Compatibility Graph Construction ---
   
-  std::vector<Edge> updateEdges(const FlopCluster& cluster, bool verbose = false);
-  std::vector<FlopClusterEntry> getIntersectedCluster(const FlopCluster& cluster, bool verbose = false) const;
+  std::vector<Edge> updateEdges(const FlopCluster& cluster, bool verbose = false, bool use_grid_hash = true);
+  std::vector<FlopClusterEntry> getIntersectedCluster(const FlopCluster& cluster, bool verbose = false, bool use_grid_hash = true) const;
+  
+  // Thread-safe parallel versions using thread-local grid
+  std::vector<Edge> updateEdgesWithGrid(const FlopCluster& cluster, bool verbose,
+                                        const std::unordered_map<GridCell, std::vector<int>, GridCellHash>& thread_local_grid);
+  std::vector<FlopClusterEntry> getIntersectedClusterWithGrid(const FlopCluster& cluster, bool verbose,
+                                                               const std::unordered_map<GridCell, std::vector<int>, GridCellHash>& thread_local_grid) const;
+  
+  // Grid-based spatial indexing helpers
+  std::vector<GridCell> getGridCells(const Box& box) const;
+  void insertClusterToGrid(int cluster_id, const Box& feasible_region);
+  void removeClusterFromGrid(int cluster_id, const Box& feasible_region);
   bool checkCompatibility(const FlopCluster& c1, const FlopCluster& c2, bool verbose = false) const;
   odb::dbMaster* getClusterMaster(const FlopCluster& cluster) const;
   PlacementCandidate calcPlacementCandidate(const FlopCluster& c1, const FlopCluster& c2, bool verbose = false);
@@ -813,6 +854,7 @@ private:
                                        const Point& new_pos, odb::dbMaster* new_master);
   double calcMergeHPWLGain(const FlopCluster& c1, const FlopCluster& c2,
                            const FloatPoint& merge_position, bool verbose = false) const;
+  void buildClusterCache(FlopCluster& cluster) const;
   std::set<std::variant<odb::dbITerm*, odb::dbBTerm*>> getConnectedPins(const FlopCluster& cluster) const;
   FloatPoint getPinCoordinate(const std::variant<odb::dbITerm*, odb::dbBTerm*>& pin_variant) const;
 
