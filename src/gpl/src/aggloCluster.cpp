@@ -3622,40 +3622,26 @@ AggloCluster::computeFinalFeasibleRegion(FlopUnit& flop,
     }
   }
   
-  // If all pins have no constraints, use the core area as feasible region
+  // If all pins have no constraints, use the flop's current location as feasible region
   if (!has_valid_region) {
-    const odb::Rect& core_area = block_->getCoreArea();
+    // Get flop's original location
+    const int flop_x = static_cast<int>(flop.orig_pt_.x);
+    const int flop_y = static_cast<int>(flop.orig_pt_.y);
     
-    // Transform the 4 corners of the core area to the 45-degree rotated coordinate system
-    const Point corner1(core_area.xMin(), core_area.yMin());
-    const Point corner2(core_area.xMax(), core_area.yMin());
-    const Point corner3(core_area.xMax(), core_area.yMax());
-    const Point corner4(core_area.xMin(), core_area.yMax());
+    // Transform to rotated coordinate system
+    const Point flop_pos(flop_x, flop_y);
+    const Point flop_pos_transformed = transformCoords(flop_pos);
     
-    const Point t1 = transformCoords(corner1);
-    const Point t2 = transformCoords(corner2);
-    const Point t3 = transformCoords(corner3);
-    const Point t4 = transformCoords(corner4);
+    const int u = flop_pos_transformed.get<0>();
+    const int v = flop_pos_transformed.get<1>();
     
-    // Find bounding box in transformed coordinates
-    const int min_u = std::min({t1.get<0>(), t2.get<0>(), t3.get<0>(), t4.get<0>()});
-    const int max_u = std::max({t1.get<0>(), t2.get<0>(), t3.get<0>(), t4.get<0>()});
-    const int min_v = std::min({t1.get<1>(), t2.get<1>(), t3.get<1>(), t4.get<1>()});
-    const int max_v = std::max({t1.get<1>(), t2.get<1>(), t3.get<1>(), t4.get<1>()});
-    
-    final_region = Box(Point(min_u, min_v), Point(max_u, max_v));
+    // Create a point box at the flop's location
+    final_region = Box(Point(u, v), Point(u, v));
     
     if (verbose) {
-      std::cout << "    All pins have no constraints - using transformed core area as feasible region" << std::endl;
-      std::cout << "    Core area (XY): [(" 
-                << core_area.xMin() << ", " << core_area.yMin() 
-                << ") - (" 
-                << core_area.xMax() << ", " << core_area.yMax() << ")]" << std::endl;
-      std::cout << "    Transformed (UV): [(" 
-                << min_u << ", " << min_v 
-                << ") - (" 
-                << max_u << ", " << max_v << ")]" << std::endl;
-      std::cout << "    Note: This may extend beyond die boundary - will be clipped during placement" << std::endl;
+      std::cout << "    All pins have no constraints - using flop's current location as feasible region" << std::endl;
+      std::cout << "    Flop location (XY): (" << flop_x << ", " << flop_y << ")" << std::endl;
+      std::cout << "    Transformed (UV): (" << u << ", " << v << ")" << std::endl;
     }
   }
   
@@ -3669,7 +3655,7 @@ AggloCluster::computeFinalFeasibleRegion(FlopUnit& flop,
                 << final_region.max_corner().get<0>() << ", " 
                 << final_region.max_corner().get<1>() << ")]" << std::endl;
     } else {
-      std::cout << "    Final feasible region (core area): [(" 
+      std::cout << "    Final feasible region (flop location): [(" 
                 << final_region.min_corner().get<0>() << ", " 
                 << final_region.min_corner().get<1>() << ") - (" 
                 << final_region.max_corner().get<0>() << ", " 
@@ -3879,7 +3865,7 @@ AggloCluster::solveMaxDistanceFanIn(float l1,
   // Step 1: Build quadratic equation coefficients for Fan-In case
   // Solve: a*x^2 + b*x + c = 0 where x is new Manhattan distance (meters)
   const auto a = unit_r * unit_c / 2;
-  const auto b = on_path_R_wo_last * unit_c + coeff * unit_c + unit_r * ipin_cap;
+  const auto b = on_path_R_wo_last * unit_c + coeff * unit_c / 2 + unit_r * ipin_cap;
   const auto c = -pow(l1, 2) * unit_r * unit_c / 2 
                  - on_path_R_wo_last * unit_c * l1 
                  - coeff * l1 * unit_c / 2 
@@ -5544,7 +5530,7 @@ AggloCluster::calcUsedSlacksFanIn(
     
     const float rc_delay = (actual_dist * actual_dist - l1 * l1) * unit_r * unit_c / 2;
     const float on_path_delay = (actual_dist - l1) * on_path_R_wo_last * unit_c;
-    const float cell_delay = coeff * (actual_dist - l1) * unit_c;
+    const float cell_delay = coeff * (actual_dist - l1) * unit_c / 2;
     const float ipin_delay = (actual_dist - l1) * unit_r * ipin_cap;
     const sta::Slack used_slack = rc_delay + on_path_delay + cell_delay + ipin_delay;
     
@@ -5676,7 +5662,7 @@ AggloCluster::implementSingleCluster(const FlopCluster& cluster, bool verbose, i
     }
   }
   
-  // Step 3: Find optimal assignment using Hungarian algorithm
+  // Step 3: Find optimal assignment using Cost-Scaling Push-Relabel algorithm
   if (verbose) {
     std::cout << "\n  [Step 3] Computing optimal port assignment..." << std::endl;
   }
@@ -5685,7 +5671,7 @@ AggloCluster::implementSingleCluster(const FlopCluster& cluster, bool verbose, i
   
   if (best_assignment.best_master_ == nullptr) {
     if (verbose) {
-      std::cout << "    ✗ SKIP: Hungarian algorithm failed" << std::endl;
+      std::cout << "    ✗ SKIP: Assignment algorithm failed" << std::endl;
     }
     return false;
   }
@@ -5747,7 +5733,7 @@ AggloCluster::implementSingleCluster(const FlopCluster& cluster, bool verbose, i
     }
     
     std::cout << "      Cost verification: computed=" << total_cost_check 
-              << ", hungarian=" << best_assignment.min_cost_;
+              << ", assignment_solver=" << best_assignment.min_cost_;
     
     if (std::abs(total_cost_check - best_assignment.min_cost_) < 1.0) {
       std::cout << " ✓" << std::endl;
@@ -5897,7 +5883,8 @@ AggloCluster::assignPorts(
       }
     }
 
-    // Solve assignment using Hungarian algorithm
+    // Solve assignment using Cost-Scaling Push-Relabel algorithm
+    // (Goldberg & Kennedy, 1995) - O(n*m*log(nC))
     graph.Build();
     ::operations_research::LinearSumAssignment assignment_solver(graph, num_left_nodes);
 
