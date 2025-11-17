@@ -417,6 +417,48 @@ struct EdgeHash
   }
 };
 
+/**
+ * @brief Group-level clustering context
+ * 
+ * Encapsulates all data structures needed for independent clustering
+ * within a compatible group (same master_mask + inst_mask).
+ * This enables group-by-group processing with O(k×n²) complexity
+ * instead of O(N²) where N is total flops and k is number of groups.
+ */
+struct GroupClusteringContext
+{
+  // Group identity
+  MasterMask master_mask_;
+  InstMask inst_mask_;
+  std::vector<int> cluster_indices_;  // Cluster indices belonging to this group
+  
+  // Local compatibility graph (only edges within this group)
+  std::set<Edge> local_edge_pq_;
+  std::unordered_map<int, std::unordered_set<Edge, EdgeHash>> local_adj_list_;
+  
+  // Local spatial index for fast intersection queries (only this group's clusters)
+  struct GridCell {
+    int x;
+    int y;
+    bool operator==(const GridCell& other) const { return x == other.x && y == other.y; }
+  };
+  
+  struct GridCellHash {
+    std::size_t operator()(const GridCell& cell) const {
+      return std::hash<int>()(cell.x) ^ (std::hash<int>()(cell.y) << 1);
+    }
+  };
+  
+  std::unordered_map<GridCell, std::set<int>, GridCellHash> local_spatial_grid_;
+  
+  // Statistics
+  int merges_{0};
+  int intermediate_merges_{0};
+  int final_merges_{0};
+  int skipped_invalid_{0};
+  int skipped_density_{0};
+};
+
 //==============================================================================
 // 5. Helper Structures (MBFF Implementation Support)
 //==============================================================================
@@ -730,7 +772,7 @@ private:
   FlopClusterRTree feasible_regions_;
   
   // Grid-based spatial hash for fast intersection queries
-  std::unordered_map<GridCell, std::vector<int>, GridCellHash> cluster_spatial_grid_;
+  std::unordered_map<GridCell, std::set<int>, GridCellHash> cluster_spatial_grid_;
   int grid_cell_size_;  // Cell size in DBU
   
   // Helper mappings
@@ -752,9 +794,17 @@ private:
   void analyzeTimingPaths();
   void calcFeasibleRegions();
   void createFlopClusters();
-  void createCompatibilityGraph();
-  void runAgglomerativeClustering();
+  void runGroupBasedClustering();  // NEW: Group-based clustering (replaces Phase 9 & 10)
   void implementClusters();
+  
+  // Group clustering helpers
+  void initializeGroupContext(GroupClusteringContext& ctx,
+                              const std::pair<MasterMask, InstMask>& masks,
+                              const std::vector<int>& flop_indices);
+  void buildGroupSpatialIndex(GroupClusteringContext& ctx);
+  void buildGroupCompatibilityGraph(GroupClusteringContext& ctx);
+  void runGroupClustering(GroupClusteringContext& ctx, bool verbose);
+  void updateGlobalSlackBudget(const GroupClusteringContext& ctx);
 
   //==========================================================================
   // Helper Functions

@@ -392,12 +392,12 @@ AggloCluster::AggloCluster(odb::dbDatabase* db,
       log_(log),
       threads_(threads),
       num_paths_per_endpoint_(num_paths_per_endpoint),
-      num_samples_(num_samples),
       target_density_(target_density),
       target_overflow_(target_overflow),
       region_scale_factor_(region_scale_factor),
-      grid_cell_size_(0),  // Will be initialized in initVirtualBinGrid
-      verbose_(verbose)
+      num_samples_(num_samples),
+      verbose_(verbose),
+      grid_cell_size_(0)  // Will be initialized in initVirtualBinGrid
 {
 }
 
@@ -435,9 +435,8 @@ AggloCluster::doAggloCluster()
   measure_phase("Phase 6: analyzeTimingPaths", [&] { analyzeTimingPaths(); });
   measure_phase("Phase 7: calcFeasibleRegions", [&] { calcFeasibleRegions(); });
   measure_phase("Phase 8: createFlopClusters", [&] { createFlopClusters(); });
-  measure_phase("Phase 9: createCompatibilityGraph", [&] { createCompatibilityGraph(); });
-  measure_phase("Phase 10: runAgglomerativeClustering", [&] { runAgglomerativeClustering(); });
-  measure_phase("Phase 11: implementClusters", [&] { implementClusters(); });
+  measure_phase("Phase 9: runGroupBasedClustering", [&] { runGroupBasedClustering(); });
+  measure_phase("Phase 10: implementClusters", [&] { implementClusters(); });
 
   const auto overall_end = Clock::now();
   const double total_seconds = std::chrono::duration<double>(overall_end - overall_start).count();
@@ -1662,9 +1661,154 @@ AggloCluster::createFlopClusters()
 }
 
 //==============================================================================
-// Phase 9: createCompatibilityGraph()
+// Phase 9: runGroupBasedClustering() - NEW GROUP-BASED APPROACH
 //==============================================================================
 
+void
+AggloCluster::runGroupBasedClustering()
+{
+  if (verbose_) {
+    std::cout << "\n[runGroupBasedClustering] Starting group-based clustering..." << std::endl;
+    std::cout << "  - Total compatible groups: " << compatible_groups_.size() << std::endl;
+    std::cout << "  - Total clusters: " << flop_clusters_.size() << std::endl;
+  }
+
+  // Sort groups by size (largest first for better progress tracking)
+  std::vector<std::pair<std::pair<MasterMask, InstMask>, std::vector<int>>> sorted_groups;
+  sorted_groups.reserve(compatible_groups_.size());
+  for (const auto& group : compatible_groups_) {
+    sorted_groups.push_back(group);
+  }
+  std::sort(sorted_groups.begin(), sorted_groups.end(),
+            [](const auto& a, const auto& b) {
+              return a.second.size() > b.second.size();  // Largest first
+            });
+
+  // Global statistics
+  int total_merges = 0;
+  int total_intermediate_merges = 0;
+  int total_final_merges = 0;
+  int total_skipped_invalid = 0;
+  int total_skipped_density = 0;
+  std::map<int, int> global_merge_size_dist;
+
+  // Process each group independently
+  for (size_t group_idx = 0; group_idx < sorted_groups.size(); ++group_idx) {
+    const auto& [masks, flop_indices] = sorted_groups[group_idx];
+    
+    if (verbose_) {
+      std::cout << "\n[Group " << (group_idx + 1) << "/" << sorted_groups.size() << "] "
+                << "Processing " << flop_indices.size() << " flops..." << std::endl;
+    }
+
+    // Initialize group context
+    GroupClusteringContext ctx;
+    initializeGroupContext(ctx, masks, flop_indices);
+    
+    if (ctx.cluster_indices_.empty()) {
+      if (verbose_) {
+        std::cout << "  Skipped: no valid clusters in this group" << std::endl;
+      }
+      continue;
+    }
+
+    if (verbose_) {
+      std::cout << "  - Clusters in group: " << ctx.cluster_indices_.size() << std::endl;
+    }
+
+    // Build group's spatial index
+    buildGroupSpatialIndex(ctx);
+    
+    // Build group's compatibility graph
+    buildGroupCompatibilityGraph(ctx);
+    
+    if (verbose_) {
+      std::cout << "  - Initial edges: " << ctx.local_edge_pq_.size() << std::endl;
+    }
+
+    // Run clustering for this group
+    const bool show_verbose = verbose_ && (group_idx < static_cast<size_t>(num_samples_));
+    runGroupClustering(ctx, show_verbose);
+    
+    // Update global slack budget after group completion
+    updateGlobalSlackBudget(ctx);
+    
+    // Accumulate statistics
+    total_merges += ctx.merges_;
+    total_intermediate_merges += ctx.intermediate_merges_;
+    total_final_merges += ctx.final_merges_;
+    total_skipped_invalid += ctx.skipped_invalid_;
+    total_skipped_density += ctx.skipped_density_;
+
+    if (verbose_) {
+      std::cout << "  Results: " << ctx.merges_ << " merges "
+                << "(intermediate: " << ctx.intermediate_merges_
+                << ", final: " << ctx.final_merges_ << ")" << std::endl;
+      if (ctx.skipped_density_ > 0 || ctx.skipped_invalid_ > 0) {
+        std::cout << "  Skipped: " << ctx.skipped_invalid_ << " invalid, "
+                  << ctx.skipped_density_ << " density" << std::endl;
+      }
+    }
+  }
+
+  // Final statistics
+  if (verbose_) {
+    std::cout << "\n[Summary] Group-based clustering completed" << std::endl;
+    std::cout << "  Total merges: " << total_merges
+              << " (intermediate: " << total_intermediate_merges
+              << ", final: " << total_final_merges << ")" << std::endl;
+    std::cout << "  Skipped: " << total_skipped_invalid << " invalid, "
+              << total_skipped_density << " density" << std::endl;
+
+    // Cluster distribution
+    std::map<int, int> cluster_size_dist;
+    int single_flop_clusters = 0;
+    int merged_clusters = 0;
+    int total_flops_in_mbff = 0;
+
+    for (size_t i = 0; i < flop_clusters_.size(); ++i) {
+      if (flop_cluster_is_valid_[i]) {
+        const int size = flop_clusters_[i].flops_.size();
+        cluster_size_dist[size]++;
+        if (size == 1) {
+          single_flop_clusters++;
+        } else {
+          merged_clusters++;
+          total_flops_in_mbff += size;
+        }
+      }
+    }
+
+    const int total_valid = single_flop_clusters + merged_clusters;
+    const int total_flops = flop_units_.size();
+    const float mbff_ratio = total_flops > 0 ? (100.0f * total_flops_in_mbff / total_flops) : 0.0f;
+
+    std::cout << "\n  Final cluster status:" << std::endl;
+    std::cout << "    Valid clusters: " << total_valid << std::endl;
+    std::cout << "    Single-flop: " << single_flop_clusters
+              << " (" << std::fixed << std::setprecision(1)
+              << (100.0f * single_flop_clusters / total_valid) << "%)" << std::endl;
+    std::cout << "    MBFF clusters: " << merged_clusters
+              << " (" << (100.0f * merged_clusters / total_valid) << "%)" << std::endl;
+    std::cout << "    Flops in MBFF: " << total_flops_in_mbff << "/" << total_flops
+              << " (" << mbff_ratio << "%)" << std::endl;
+
+    if (!cluster_size_dist.empty()) {
+      std::cout << "\n  Cluster size distribution:" << std::endl;
+      for (const auto& [size, count] : cluster_size_dist) {
+        std::cout << "    " << size << "-bit: " << count << " cluster(s)" << std::endl;
+      }
+    }
+
+    std::cout << "[runGroupBasedClustering] Completed successfully.\n" << std::endl;
+  }
+}
+
+//==============================================================================
+// OLD Phase 9: createCompatibilityGraph() - DEPRECATED
+//==============================================================================
+
+/*
 void
 AggloCluster::createCompatibilityGraph()
 {
@@ -1812,11 +1956,13 @@ AggloCluster::createCompatibilityGraph()
     }
   }
 }
+*/
 
 //==============================================================================
-// Phase 10: runAgglomerativeClustering()
+// OLD Phase 10: runAgglomerativeClustering() - DEPRECATED
 //==============================================================================
 
+/*
 void 
 AggloCluster::runAgglomerativeClustering()
 {
@@ -2312,9 +2458,783 @@ AggloCluster::runAgglomerativeClustering()
     std::cout << "[runAgglomerativeClustering] Completed successfully.\n" << std::endl;
   }
 }
+*/
 
 //==============================================================================
-// Phase 11: implementClusters()
+// Group-based Clustering Helper Functions
+//==============================================================================
+
+void
+AggloCluster::initializeGroupContext(GroupClusteringContext& ctx,
+                                     const std::pair<MasterMask, InstMask>& masks,
+                                     const std::vector<int>& flop_indices)
+{
+  ctx.master_mask_ = masks.first;
+  ctx.inst_mask_ = masks.second;
+  
+  // Build cluster set for this group
+  for (int flop_idx : flop_indices) {
+    const int cluster_idx = flop_units_[flop_idx].cluster_idx_;
+    if (flop_cluster_is_valid_[cluster_idx]) {
+      ctx.cluster_indices_.push_back(cluster_idx);
+    }
+  }
+}
+
+void
+AggloCluster::buildGroupSpatialIndex(GroupClusteringContext& ctx)
+{
+  // Build spatial grid for this group's clusters only
+  for (int cluster_idx : ctx.cluster_indices_) {
+    const FlopCluster& cluster = flop_clusters_[cluster_idx];
+    if (boost::geometry::is_empty(cluster.feasible_region_)) {
+      continue;
+    }
+    
+    const Box& bbox = cluster.feasible_region_;
+    const int min_x = bbox.min_corner().get<0>();
+    const int min_y = bbox.min_corner().get<1>();
+    const int max_x = bbox.max_corner().get<0>();
+    const int max_y = bbox.max_corner().get<1>();
+    
+    const int cell_min_x = min_x / grid_cell_size_;
+    const int cell_min_y = min_y / grid_cell_size_;
+    const int cell_max_x = max_x / grid_cell_size_;
+    const int cell_max_y = max_y / grid_cell_size_;
+    
+    for (int cx = cell_min_x; cx <= cell_max_x; ++cx) {
+      for (int cy = cell_min_y; cy <= cell_max_y; ++cy) {
+        GroupClusteringContext::GridCell cell{cx, cy};
+        ctx.local_spatial_grid_[cell].insert(cluster_idx);
+      }
+    }
+  }
+}
+
+void
+AggloCluster::buildGroupCompatibilityGraph(GroupClusteringContext& ctx)
+{
+  // Build edges between compatible clusters in this group only
+  
+  if (threads_ > 1 && ctx.cluster_indices_.size() > 1) {
+    // CRITICAL: Pre-build all cluster caches to avoid race conditions
+    // (calcPlacementCandidate → calcMedianBox → buildClusterCache modifies cluster.external_pins_cache_)
+    for (int cluster_idx : ctx.cluster_indices_) {
+      if (flop_cluster_is_valid_[cluster_idx]) {
+        buildClusterCache(flop_clusters_[cluster_idx]);
+      }
+    }
+    
+    // Parallel edge generation with thread-local edge collections
+    std::vector<std::vector<Edge>> thread_local_edges(ctx.cluster_indices_.size());
+    
+    #pragma omp parallel for num_threads(threads_) schedule(dynamic)
+    for (size_t i = 0; i < ctx.cluster_indices_.size(); ++i) {
+      const int cluster_idx = ctx.cluster_indices_[i];
+      const FlopCluster& cluster = flop_clusters_[cluster_idx];
+      
+      // Skip invalid or no-merge clusters
+      if (!flop_cluster_is_valid_[cluster_idx] ||
+          flop_cluster_no_further_merge_[cluster_idx] ||
+          boost::geometry::is_empty(cluster.feasible_region_)) {
+        continue;
+      }
+      
+      // Find intersecting clusters using group's local spatial grid
+      const Box& bbox = cluster.feasible_region_;
+      const int min_x = bbox.min_corner().get<0>();
+      const int min_y = bbox.min_corner().get<1>();
+      const int max_x = bbox.max_corner().get<0>();
+      const int max_y = bbox.max_corner().get<1>();
+      
+      const int cell_min_x = min_x / grid_cell_size_;
+      const int cell_min_y = min_y / grid_cell_size_;
+      const int cell_max_x = max_x / grid_cell_size_;
+      const int cell_max_y = max_y / grid_cell_size_;
+      
+      std::set<int> candidate_clusters;
+      for (int cx = cell_min_x; cx <= cell_max_x; ++cx) {
+        for (int cy = cell_min_y; cy <= cell_max_y; ++cy) {
+          GroupClusteringContext::GridCell cell{cx, cy};
+          auto it = ctx.local_spatial_grid_.find(cell);
+          if (it != ctx.local_spatial_grid_.end()) {
+            for (int candidate_idx : it->second) {
+              if (candidate_idx > cluster_idx) {  // Only consider higher indices to avoid duplicates
+                candidate_clusters.insert(candidate_idx);
+              }
+            }
+          }
+        }
+      }
+      
+      // Create edges with intersecting clusters
+      for (int other_idx : candidate_clusters) {
+        if (!flop_cluster_is_valid_[other_idx] ||
+            flop_cluster_no_further_merge_[other_idx]) {
+          continue;
+        }
+        
+        const FlopCluster& other = flop_clusters_[other_idx];
+        
+        // Check if feasible regions actually intersect
+        if (boost::geometry::is_empty(other.feasible_region_) ||
+            !boost::geometry::intersects(cluster.feasible_region_, other.feasible_region_)) {
+          continue;
+        }
+        
+        // Masks should already match (same group), but double check
+        if (!(cluster.master_mask_ == other.master_mask_ &&
+              cluster.inst_mask_ == other.inst_mask_)) {
+          continue;
+        }
+        
+        // Check if merged master exists
+        const int merged_bits = cluster.flops_.size() + other.flops_.size();
+        const auto rep_it = representative_masters_.find(cluster.master_mask_);
+        if (rep_it == representative_masters_.end() || 
+            rep_it->second.find(merged_bits) == rep_it->second.end()) {
+          continue;
+        }
+        
+        // Calculate placement candidate (HPWL-based gain)
+        const PlacementCandidate pc = calcPlacementCandidate(cluster, other, false);
+        
+        if (!pc.is_valid_) {
+          continue;
+        }
+        
+        // Store edge in thread-local vector
+        Edge edge(cluster_idx, other_idx, pc.merge_gain_, pc.placement_pos_);
+        thread_local_edges[i].push_back(edge);
+      }
+    }
+    
+    // Merge all thread-local edges into global structures (sequential)
+    for (const auto& edges : thread_local_edges) {
+      for (const Edge& edge : edges) {
+        ctx.local_edge_pq_.insert(edge);
+        ctx.local_adj_list_[edge.n1].insert(edge);
+        ctx.local_adj_list_[edge.n2].insert(edge);
+      }
+    }
+    
+  } else {
+    // Sequential fallback for single thread or small groups
+    std::set<std::pair<int, int>> edge_pairs;  // Track duplicates
+    
+    for (int cluster_idx : ctx.cluster_indices_) {
+      const FlopCluster& cluster = flop_clusters_[cluster_idx];
+      
+      // Skip invalid or no-merge clusters
+      if (!flop_cluster_is_valid_[cluster_idx] ||
+          flop_cluster_no_further_merge_[cluster_idx] ||
+          boost::geometry::is_empty(cluster.feasible_region_)) {
+        continue;
+      }
+      
+      // Find intersecting clusters using group's local spatial grid
+      const Box& bbox = cluster.feasible_region_;
+      const int min_x = bbox.min_corner().get<0>();
+      const int min_y = bbox.min_corner().get<1>();
+      const int max_x = bbox.max_corner().get<0>();
+      const int max_y = bbox.max_corner().get<1>();
+      
+      const int cell_min_x = min_x / grid_cell_size_;
+      const int cell_min_y = min_y / grid_cell_size_;
+      const int cell_max_x = max_x / grid_cell_size_;
+      const int cell_max_y = max_y / grid_cell_size_;
+      
+      std::set<int> candidate_clusters;
+      for (int cx = cell_min_x; cx <= cell_max_x; ++cx) {
+        for (int cy = cell_min_y; cy <= cell_max_y; ++cy) {
+          GroupClusteringContext::GridCell cell{cx, cy};
+          auto it = ctx.local_spatial_grid_.find(cell);
+          if (it != ctx.local_spatial_grid_.end()) {
+            for (int candidate_idx : it->second) {
+              if (candidate_idx != cluster_idx) {
+                candidate_clusters.insert(candidate_idx);
+              }
+            }
+          }
+        }
+      }
+      
+      // Create edges with intersecting clusters
+      for (int other_idx : candidate_clusters) {
+        if (!flop_cluster_is_valid_[other_idx] ||
+            flop_cluster_no_further_merge_[other_idx]) {
+          continue;
+        }
+        
+        // Check for duplicate edge (works for any cluster_idx order)
+        const auto edge_pair = std::minmax(cluster_idx, other_idx);
+        if (!edge_pairs.insert(edge_pair).second) {
+          continue;  // Already processed this pair
+        }
+        
+        const FlopCluster& other = flop_clusters_[other_idx];
+        
+        // Check if feasible regions actually intersect
+        if (boost::geometry::is_empty(other.feasible_region_) ||
+            !boost::geometry::intersects(cluster.feasible_region_, other.feasible_region_)) {
+          continue;
+        }
+        
+        // Masks should already match (same group), but double check
+        if (!(cluster.master_mask_ == other.master_mask_ &&
+              cluster.inst_mask_ == other.inst_mask_)) {
+          continue;
+        }
+        
+        // Check if merged master exists
+        const int merged_bits = cluster.flops_.size() + other.flops_.size();
+        const auto rep_it = representative_masters_.find(cluster.master_mask_);
+        if (rep_it == representative_masters_.end() || 
+            rep_it->second.find(merged_bits) == rep_it->second.end()) {
+          continue;
+        }
+        
+        // Calculate placement candidate (HPWL-based gain)
+        const PlacementCandidate pc = calcPlacementCandidate(cluster, other, false);
+        
+        if (!pc.is_valid_) {
+          continue;
+        }
+        
+        // Create edge with HPWL gain as weight
+        Edge edge(cluster_idx, other_idx, pc.merge_gain_, pc.placement_pos_);
+        ctx.local_edge_pq_.insert(edge);
+        ctx.local_adj_list_[cluster_idx].insert(edge);
+        ctx.local_adj_list_[other_idx].insert(edge);
+      }
+    }
+  }
+}
+
+void
+AggloCluster::runGroupClustering(GroupClusteringContext& ctx, bool verbose)
+{
+  int iteration = 0;
+  
+  if (verbose) {
+    std::cout << "  [runGroupClustering] Initial edges: " << ctx.local_edge_pq_.size() << std::endl;
+  }
+  
+  while (!ctx.local_edge_pq_.empty()) {
+    const Edge best_edge = *ctx.local_edge_pq_.begin();
+    ctx.local_edge_pq_.erase(ctx.local_edge_pq_.begin());
+
+    const int n1_idx = best_edge.n1;
+    const int n2_idx = best_edge.n2;
+
+    if (!flop_cluster_is_valid_[n1_idx] || !flop_cluster_is_valid_[n2_idx]) {
+      ctx.skipped_invalid_++;
+      continue;
+    }
+
+    const FlopCluster& c1 = flop_clusters_[n1_idx];
+    const FlopCluster& c2 = flop_clusters_[n2_idx];
+    const bool show_debug = verbose && (ctx.merges_ < num_samples_);
+
+    // Density check
+    bool density_ok = true;
+    odb::dbMaster* master1 = nullptr;
+    odb::dbMaster* master2 = nullptr;
+    odb::dbMaster* merged_master = nullptr;
+    
+    const int merged_bits = static_cast<int>(c1.flops_.size() + c2.flops_.size());
+    const auto rep_it = representative_masters_.find(c1.master_mask_);
+    if (rep_it != representative_masters_.end()) {
+      const auto bit_it = rep_it->second.find(merged_bits);
+      if (bit_it != rep_it->second.end()) {
+        merged_master = bit_it->second;
+        master1 = getClusterMaster(c1);
+        master2 = getClusterMaster(c2);
+      }
+    }
+
+    if (!master1 || !master2 || !merged_master) {
+      density_ok = false;
+    } else {
+      const Point c1_pos(std::lround(c1.curr_pt_.x), std::lround(c1.curr_pt_.y));
+      const Point c2_pos(std::lround(c2.curr_pt_.x), std::lround(c2.curr_pt_.y));
+      const Point merged_pos(std::lround(best_edge.pos.x), std::lround(best_edge.pos.y));
+
+      density_ok = !virtual_bin_grid_.wouldOverflow(master1, c1_pos,
+                                                    master2, c2_pos,
+                                                    merged_master, merged_pos);
+    }
+
+    if (!density_ok) {
+      ctx.skipped_density_++;
+      
+      // Refresh edges (using group-local edge management)
+      for (int cluster_idx : {n1_idx, n2_idx}) {
+        if (flop_cluster_is_valid_[cluster_idx] &&
+            !flop_cluster_no_further_merge_[cluster_idx]) {
+          
+          // Remove old edges for this cluster first
+          if (ctx.local_adj_list_.find(cluster_idx) != ctx.local_adj_list_.end()) {
+            for (const Edge& edge : ctx.local_adj_list_[cluster_idx]) {
+              ctx.local_edge_pq_.erase(edge);
+              const int neighbor_idx = (edge.n1 == cluster_idx) ? edge.n2 : edge.n1;
+              if (ctx.local_adj_list_.count(neighbor_idx)) {
+                ctx.local_adj_list_[neighbor_idx].erase(edge);
+              }
+            }
+            ctx.local_adj_list_.erase(cluster_idx);
+          }
+          
+          // Generate new edges for this cluster
+          const FlopCluster& cluster = flop_clusters_[cluster_idx];
+          
+          // Use group's local spatial grid to find neighbors
+          if (boost::geometry::is_empty(cluster.feasible_region_)) {
+            continue;
+          }
+          
+          const Box& bbox = cluster.feasible_region_;
+          const int min_x = bbox.min_corner().get<0>();
+          const int min_y = bbox.min_corner().get<1>();
+          const int max_x = bbox.max_corner().get<0>();
+          const int max_y = bbox.max_corner().get<1>();
+          
+          const int cell_min_x = min_x / grid_cell_size_;
+          const int cell_min_y = min_y / grid_cell_size_;
+          const int cell_max_x = max_x / grid_cell_size_;
+          const int cell_max_y = max_y / grid_cell_size_;
+          
+          std::set<int> neighbor_indices;
+          for (int cx = cell_min_x; cx <= cell_max_x; ++cx) {
+            for (int cy = cell_min_y; cy <= cell_max_y; ++cy) {
+              GroupClusteringContext::GridCell cell{cx, cy};
+              auto it = ctx.local_spatial_grid_.find(cell);
+              if (it != ctx.local_spatial_grid_.end()) {
+                for (int neighbor_idx : it->second) {
+                  if (neighbor_idx != cluster_idx &&
+                      flop_cluster_is_valid_[neighbor_idx] &&
+                      !flop_cluster_no_further_merge_[neighbor_idx]) {
+                    neighbor_indices.insert(neighbor_idx);
+                  }
+                }
+              }
+            }
+          }
+          
+          // Rebuild cache for cluster and all neighbors
+          buildClusterCache(flop_clusters_[cluster_idx]);
+          for (int neighbor_idx : neighbor_indices) {
+            buildClusterCache(flop_clusters_[neighbor_idx]);
+          }
+          
+          // Create edges with neighbors
+          for (int neighbor_idx : neighbor_indices) {
+            const FlopCluster& cluster = flop_clusters_[cluster_idx];
+            const FlopCluster& neighbor = flop_clusters_[neighbor_idx];
+            
+            if (boost::geometry::is_empty(neighbor.feasible_region_) ||
+                !boost::geometry::intersects(cluster.feasible_region_, neighbor.feasible_region_)) {
+              continue;
+            }
+            
+            // Check merged master exists
+            const int merge_bits = cluster.flops_.size() + neighbor.flops_.size();
+            const auto rep = representative_masters_.find(cluster.master_mask_);
+            if (rep == representative_masters_.end() || 
+                rep->second.find(merge_bits) == rep->second.end()) {
+              continue;
+            }
+            
+            // Calculate placement candidate
+            const PlacementCandidate pc = calcPlacementCandidate(cluster, neighbor, false);
+            if (!pc.is_valid_) {
+              continue;
+            }
+            
+            Edge edge(cluster_idx, neighbor_idx, pc.merge_gain_, pc.placement_pos_);
+            ctx.local_edge_pq_.insert(edge);
+            ctx.local_adj_list_[cluster_idx].insert(edge);
+            ctx.local_adj_list_[neighbor_idx].insert(edge);
+          }
+        }
+      }
+      
+      continue;
+    }
+
+    // Execute merge
+    const int new_cluster_idx = mergeClusters(best_edge, show_debug);
+    const FlopCluster& new_cluster = flop_clusters_[new_cluster_idx];
+
+    ctx.merges_++;
+    
+    // Update spatial grid: remove old clusters, add new cluster
+    // Remove n1_idx from spatial grid
+    if (!boost::geometry::is_empty(c1.feasible_region_)) {
+      const Box& bbox1 = c1.feasible_region_;
+      const int cell_min_x1 = bbox1.min_corner().get<0>() / grid_cell_size_;
+      const int cell_min_y1 = bbox1.min_corner().get<1>() / grid_cell_size_;
+      const int cell_max_x1 = bbox1.max_corner().get<0>() / grid_cell_size_;
+      const int cell_max_y1 = bbox1.max_corner().get<1>() / grid_cell_size_;
+      
+      for (int cx = cell_min_x1; cx <= cell_max_x1; ++cx) {
+        for (int cy = cell_min_y1; cy <= cell_max_y1; ++cy) {
+          GroupClusteringContext::GridCell cell{cx, cy};
+          auto it = ctx.local_spatial_grid_.find(cell);
+          if (it != ctx.local_spatial_grid_.end()) {
+            it->second.erase(n1_idx);
+            if (it->second.empty()) {
+              ctx.local_spatial_grid_.erase(it);
+            }
+          }
+        }
+      }
+    }
+    
+    // Remove n2_idx from spatial grid
+    if (!boost::geometry::is_empty(c2.feasible_region_)) {
+      const Box& bbox2 = c2.feasible_region_;
+      const int cell_min_x2 = bbox2.min_corner().get<0>() / grid_cell_size_;
+      const int cell_min_y2 = bbox2.min_corner().get<1>() / grid_cell_size_;
+      const int cell_max_x2 = bbox2.max_corner().get<0>() / grid_cell_size_;
+      const int cell_max_y2 = bbox2.max_corner().get<1>() / grid_cell_size_;
+      
+      for (int cx = cell_min_x2; cx <= cell_max_x2; ++cx) {
+        for (int cy = cell_min_y2; cy <= cell_max_y2; ++cy) {
+          GroupClusteringContext::GridCell cell{cx, cy};
+          auto it = ctx.local_spatial_grid_.find(cell);
+          if (it != ctx.local_spatial_grid_.end()) {
+            it->second.erase(n2_idx);
+            if (it->second.empty()) {
+              ctx.local_spatial_grid_.erase(it);
+            }
+          }
+        }
+      }
+    }
+    
+    // Add new_cluster to spatial grid
+    if (!boost::geometry::is_empty(new_cluster.feasible_region_)) {
+      const Box& bbox_new = new_cluster.feasible_region_;
+      const int cell_min_x_new = bbox_new.min_corner().get<0>() / grid_cell_size_;
+      const int cell_min_y_new = bbox_new.min_corner().get<1>() / grid_cell_size_;
+      const int cell_max_x_new = bbox_new.max_corner().get<0>() / grid_cell_size_;
+      const int cell_max_y_new = bbox_new.max_corner().get<1>() / grid_cell_size_;
+      
+      for (int cx = cell_min_x_new; cx <= cell_max_x_new; ++cx) {
+        for (int cy = cell_min_y_new; cy <= cell_max_y_new; ++cy) {
+          GroupClusteringContext::GridCell cell{cx, cy};
+          ctx.local_spatial_grid_[cell].insert(new_cluster_idx);
+        }
+      }
+    }
+    
+    // Determine if can merge further
+    const bool can_merge_further = isFurtherMergeable(new_cluster, show_debug);
+
+    if (can_merge_further) {
+      ctx.intermediate_merges_++;
+      
+      if (show_debug) {
+        std::cout << "  [Intermediate merge] Creating edges for new cluster " << new_cluster_idx << std::endl;
+      }
+      
+      // Remove old edges from merged clusters (n1_idx and n2_idx are now invalid)
+      // Remove edges for n1
+      if (ctx.local_adj_list_.find(n1_idx) != ctx.local_adj_list_.end()) {
+        for (const Edge& edge : ctx.local_adj_list_[n1_idx]) {
+          ctx.local_edge_pq_.erase(edge);
+          const int neighbor_idx = (edge.n1 == n1_idx) ? edge.n2 : edge.n1;
+          if (ctx.local_adj_list_.count(neighbor_idx)) {
+            ctx.local_adj_list_[neighbor_idx].erase(edge);
+          }
+        }
+        ctx.local_adj_list_.erase(n1_idx);
+      }
+      
+      // Remove edges for n2
+      if (ctx.local_adj_list_.find(n2_idx) != ctx.local_adj_list_.end()) {
+        for (const Edge& edge : ctx.local_adj_list_[n2_idx]) {
+          ctx.local_edge_pq_.erase(edge);
+          const int neighbor_idx = (edge.n1 == n2_idx) ? edge.n2 : edge.n1;
+          if (ctx.local_adj_list_.count(neighbor_idx)) {
+            ctx.local_adj_list_[neighbor_idx].erase(edge);
+          }
+        }
+        ctx.local_adj_list_.erase(n2_idx);
+      }
+      
+      // Rebuild edges for new cluster (using group's spatial index)
+      // This is similar to the refresh logic above
+      if (boost::geometry::is_empty(new_cluster.feasible_region_)) {
+        continue;
+      }
+      
+      const Box& bbox = new_cluster.feasible_region_;
+      const int min_x = bbox.min_corner().get<0>();
+      const int min_y = bbox.min_corner().get<1>();
+      const int max_x = bbox.max_corner().get<0>();
+      const int max_y = bbox.max_corner().get<1>();
+      
+      const int cell_min_x = min_x / grid_cell_size_;
+      const int cell_min_y = min_y / grid_cell_size_;
+      const int cell_max_x = max_x / grid_cell_size_;
+      const int cell_max_y = max_y / grid_cell_size_;
+      
+      std::set<int> neighbor_indices;
+      for (int cx = cell_min_x; cx <= cell_max_x; ++cx) {
+        for (int cy = cell_min_y; cy <= cell_max_y; ++cy) {
+          GroupClusteringContext::GridCell cell{cx, cy};
+          auto it = ctx.local_spatial_grid_.find(cell);
+          if (it != ctx.local_spatial_grid_.end()) {
+            for (int neighbor_idx : it->second) {
+              if (neighbor_idx != new_cluster_idx &&
+                  flop_cluster_is_valid_[neighbor_idx] &&
+                  !flop_cluster_no_further_merge_[neighbor_idx]) {
+                neighbor_indices.insert(neighbor_idx);
+              }
+            }
+          }
+        }
+      }
+      
+      // CRITICAL: Rebuild cache for all neighbors to ensure calcPlacementCandidate works correctly
+      // (Neighbors may have stale cache with references to merged clusters n1_idx, n2_idx)
+      for (int neighbor_idx : neighbor_indices) {
+        buildClusterCache(flop_clusters_[neighbor_idx]);
+      }
+      
+      for (int neighbor_idx : neighbor_indices) {
+        const FlopCluster& neighbor = flop_clusters_[neighbor_idx];
+        
+        if (boost::geometry::is_empty(neighbor.feasible_region_) ||
+            !boost::geometry::intersects(new_cluster.feasible_region_, neighbor.feasible_region_)) {
+          continue;
+        }
+        
+        const int merge_bits = new_cluster.flops_.size() + neighbor.flops_.size();
+        const auto rep = representative_masters_.find(new_cluster.master_mask_);
+        if (rep == representative_masters_.end() || 
+            rep->second.find(merge_bits) == rep->second.end()) {
+          continue;
+        }
+        
+        // Calculate placement candidate
+        const PlacementCandidate pc = calcPlacementCandidate(new_cluster, neighbor, false);
+        if (!pc.is_valid_) {
+          continue;
+        }
+        
+        Edge edge(new_cluster_idx, neighbor_idx, pc.merge_gain_, pc.placement_pos_);
+        ctx.local_edge_pq_.insert(edge);
+        ctx.local_adj_list_[new_cluster_idx].insert(edge);
+        ctx.local_adj_list_[neighbor_idx].insert(edge);
+      }
+      
+      if (show_debug) {
+        std::cout << "    New edges created: " << ctx.local_adj_list_[new_cluster_idx].size() << std::endl;
+      }
+    } else {
+      ctx.final_merges_++;
+      flop_cluster_no_further_merge_[new_cluster_idx] = true;
+
+      // Remove old edges from merged clusters (n1_idx and n2_idx are now invalid and won't merge further)
+      // Remove edges for n1
+      if (ctx.local_adj_list_.find(n1_idx) != ctx.local_adj_list_.end()) {
+        for (const Edge& edge : ctx.local_adj_list_[n1_idx]) {
+          ctx.local_edge_pq_.erase(edge);
+          const int neighbor_idx = (edge.n1 == n1_idx) ? edge.n2 : edge.n1;
+          if (ctx.local_adj_list_.count(neighbor_idx)) {
+            ctx.local_adj_list_[neighbor_idx].erase(edge);
+          }
+        }
+        ctx.local_adj_list_.erase(n1_idx);
+      }
+      
+      // Remove edges for n2
+      if (ctx.local_adj_list_.find(n2_idx) != ctx.local_adj_list_.end()) {
+        for (const Edge& edge : ctx.local_adj_list_[n2_idx]) {
+          ctx.local_edge_pq_.erase(edge);
+          const int neighbor_idx = (edge.n1 == n2_idx) ? edge.n2 : edge.n1;
+          if (ctx.local_adj_list_.count(neighbor_idx)) {
+            ctx.local_adj_list_[neighbor_idx].erase(edge);
+          }
+        }
+        ctx.local_adj_list_.erase(n2_idx);
+      }
+      
+      // Remove edges for new_cluster (since it won't merge further)
+      if (ctx.local_adj_list_.find(new_cluster_idx) != ctx.local_adj_list_.end()) {
+        for (const Edge& edge : ctx.local_adj_list_[new_cluster_idx]) {
+          ctx.local_edge_pq_.erase(edge);
+          const int neighbor_idx = (edge.n1 == new_cluster_idx) ? edge.n2 : edge.n1;
+          if (ctx.local_adj_list_.count(neighbor_idx)) {
+            ctx.local_adj_list_[neighbor_idx].erase(edge);
+          }
+        }
+        ctx.local_adj_list_.erase(new_cluster_idx);
+      }
+
+      // Distribute slack (affects other groups potentially)
+      const std::set<int> affected_flop_units = distributeSlack(new_cluster, show_debug);
+      
+      // Update feasible regions for affected flops (parallel if beneficial)
+      std::set<int> affected_clusters;
+      
+      if (threads_ > 1 && affected_flop_units.size() > 4) {
+        // Parallel processing for many affected flops
+        std::vector<int> flop_indices(affected_flop_units.begin(), affected_flop_units.end());
+        
+        #pragma omp parallel for num_threads(threads_) schedule(dynamic)
+        for (size_t i = 0; i < flop_indices.size(); ++i) {
+          calcFeasibleRegion(flop_units_[flop_indices[i]], false);
+        }
+        
+        // Collect affected clusters (must be sequential due to set insert)
+        for (int u_idx : affected_flop_units) {
+          const int c_idx = flop_units_[u_idx].cluster_idx_;
+          if (flop_cluster_is_valid_[c_idx] && !flop_cluster_no_further_merge_[c_idx]) {
+            affected_clusters.insert(c_idx);
+          }
+        }
+      } else {
+        // Sequential processing for small sets
+        for (int u_idx : affected_flop_units) {
+          calcFeasibleRegion(flop_units_[u_idx], false);
+          
+          const int c_idx = flop_units_[u_idx].cluster_idx_;
+          if (flop_cluster_is_valid_[c_idx] && !flop_cluster_no_further_merge_[c_idx]) {
+            affected_clusters.insert(c_idx);
+          }
+        }
+      }
+      
+      // Update feasible regions for affected clusters (parallel if beneficial)
+      if (threads_ > 1 && affected_clusters.size() > 2) {
+        std::vector<int> cluster_indices(affected_clusters.begin(), affected_clusters.end());
+        
+        #pragma omp parallel for num_threads(threads_) schedule(dynamic)
+        for (size_t i = 0; i < cluster_indices.size(); ++i) {
+          updateFeasibleRegion(flop_clusters_[cluster_indices[i]], false);
+        }
+      } else {
+        // Sequential processing for small sets
+        for (int c_idx : affected_clusters) {
+          updateFeasibleRegion(flop_clusters_[c_idx], false);
+        }
+      }
+      
+      // Update edges for affected clusters (only those in THIS group)
+      for (int c_idx : affected_clusters) {
+        
+        // Only update edges if cluster is in THIS group
+        auto it = std::find(ctx.cluster_indices_.begin(), ctx.cluster_indices_.end(), c_idx);
+        if (it != ctx.cluster_indices_.end()) {
+          // Remove old edges for this cluster first
+          if (ctx.local_adj_list_.find(c_idx) != ctx.local_adj_list_.end()) {
+            for (const Edge& edge : ctx.local_adj_list_[c_idx]) {
+              ctx.local_edge_pq_.erase(edge);
+              const int neighbor_idx = (edge.n1 == c_idx) ? edge.n2 : edge.n1;
+              if (ctx.local_adj_list_.count(neighbor_idx)) {
+                ctx.local_adj_list_[neighbor_idx].erase(edge);
+              }
+            }
+            ctx.local_adj_list_.erase(c_idx);
+          }
+          
+          // Rebuild edges for affected cluster (same logic as above)
+          const FlopCluster& cluster = flop_clusters_[c_idx];
+          
+          if (boost::geometry::is_empty(cluster.feasible_region_)) {
+            continue;
+          }
+          
+          const Box& bbox = cluster.feasible_region_;
+          const int min_x = bbox.min_corner().get<0>();
+          const int min_y = bbox.min_corner().get<1>();
+          const int max_x = bbox.max_corner().get<0>();
+          const int max_y = bbox.max_corner().get<1>();
+          
+          const int cell_min_x = min_x / grid_cell_size_;
+          const int cell_min_y = min_y / grid_cell_size_;
+          const int cell_max_x = max_x / grid_cell_size_;
+          const int cell_max_y = max_y / grid_cell_size_;
+          
+          std::set<int> neighbor_indices;
+          for (int cx = cell_min_x; cx <= cell_max_x; ++cx) {
+            for (int cy = cell_min_y; cy <= cell_max_y; ++cy) {
+              GroupClusteringContext::GridCell cell{cx, cy};
+              auto grid_it = ctx.local_spatial_grid_.find(cell);
+              if (grid_it != ctx.local_spatial_grid_.end()) {
+                for (int neighbor_idx : grid_it->second) {
+                  if (neighbor_idx != c_idx &&
+                      flop_cluster_is_valid_[neighbor_idx] &&
+                      !flop_cluster_no_further_merge_[neighbor_idx]) {
+                    neighbor_indices.insert(neighbor_idx);
+                  }
+                }
+              }
+            }
+          }
+          
+          // Rebuild cache for affected cluster and all neighbors
+          buildClusterCache(flop_clusters_[c_idx]);
+          for (int neighbor_idx : neighbor_indices) {
+            buildClusterCache(flop_clusters_[neighbor_idx]);
+          }
+          
+          for (int neighbor_idx : neighbor_indices) {
+            const FlopCluster& cluster = flop_clusters_[c_idx];
+            const FlopCluster& neighbor = flop_clusters_[neighbor_idx];
+            
+            if (boost::geometry::is_empty(neighbor.feasible_region_) ||
+                !boost::geometry::intersects(cluster.feasible_region_, neighbor.feasible_region_)) {
+              continue;
+            }
+            
+            const int merge_bits = cluster.flops_.size() + neighbor.flops_.size();
+            const auto rep = representative_masters_.find(cluster.master_mask_);
+            if (rep == representative_masters_.end() || 
+                rep->second.find(merge_bits) == rep->second.end()) {
+              continue;
+            }
+            
+            // Calculate placement candidate
+            const PlacementCandidate pc = calcPlacementCandidate(cluster, neighbor, false);
+            if (!pc.is_valid_) {
+              continue;
+            }
+            
+            Edge edge(c_idx, neighbor_idx, pc.merge_gain_, pc.placement_pos_);
+            ctx.local_edge_pq_.insert(edge);
+            ctx.local_adj_list_[c_idx].insert(edge);
+            ctx.local_adj_list_[neighbor_idx].insert(edge);
+          }
+        }
+      }
+    }
+
+    iteration++;
+  }
+}
+
+void
+AggloCluster::updateGlobalSlackBudget(const GroupClusteringContext& ctx)
+{
+  // After group clustering completes, recalculate feasible regions
+  // for clusters in OTHER groups that might be affected by slack distribution
+  // (This is currently a no-op placeholder - slack effects are already handled
+  // during runGroupClustering via distributeSlack calls)
+  
+  // If we wanted to be more sophisticated, we could:
+  // 1. Track which timing paths were updated
+  // 2. Find clusters in other groups affected by those paths
+  // 3. Update their feasible regions
+  // But for now, the current approach (immediate slack distribution) should work
+}
+
+//==============================================================================
+// Phase 10: implementClusters()
 //==============================================================================
 
 void 
@@ -4779,7 +5699,7 @@ AggloCluster::insertClusterToGrid(int cluster_id, const Box& feasible_region)
   const std::vector<GridCell> cells = getGridCells(feasible_region);
   
   for (const GridCell& cell : cells) {
-    cluster_spatial_grid_[cell].push_back(cluster_id);
+    cluster_spatial_grid_[cell].insert(cluster_id);
   }
 }
 
@@ -4791,13 +5711,11 @@ AggloCluster::removeClusterFromGrid(int cluster_id, const Box& feasible_region)
   for (const GridCell& cell : cells) {
     auto it = cluster_spatial_grid_.find(cell);
     if (it != cluster_spatial_grid_.end()) {
-      auto& cluster_list = it->second;
-      cluster_list.erase(
-          std::remove(cluster_list.begin(), cluster_list.end(), cluster_id),
-          cluster_list.end());
+      auto& cluster_set = it->second;
+      cluster_set.erase(cluster_id);
       
       // Remove empty cells to save memory
-      if (cluster_list.empty()) {
+      if (cluster_set.empty()) {
         cluster_spatial_grid_.erase(it);
       }
     }
@@ -5548,13 +6466,23 @@ AggloCluster::mergeClusters(const Edge& edge, bool verbose)
   flop_cluster_is_valid_[edge.n1] = false;
   flop_cluster_is_valid_[edge.n2] = false;
 
+  // CRITICAL: Get masters BEFORE vector reallocation (which invalidates c1, c2 references)
+  odb::dbMaster* master1 = getClusterMaster(c1);
+  odb::dbMaster* master2 = getClusterMaster(c2);
+
   // Remove old edges and feasible regions
-  removeEdges(c1, verbose);
-  removeEdges(c2, verbose);
+  // NOTE: removeEdges() operates on global graph, but group-based clustering uses local graph
+  // So these calls will show "No edges" - this is expected and harmless
+  removeEdges(c1, false);  // Suppress verbose to avoid confusion
+  removeEdges(c2, false);
   feasible_regions_.remove(std::make_pair(c1.feasible_region_, edge.n1));
   feasible_regions_.remove(std::make_pair(c2.feasible_region_, edge.n2));
   removeClusterFromGrid(edge.n1, c1.feasible_region_);  // Remove from spatial grid
   removeClusterFromGrid(edge.n2, c2.feasible_region_);  // Remove from spatial grid
+  
+  // Save positions before vector reallocation
+  const Point c1_pos(std::lround(c1.curr_pt_.x), std::lround(c1.curr_pt_.y));
+  const Point c2_pos(std::lround(c2.curr_pt_.x), std::lround(c2.curr_pt_.y));
 
   // Create new merged cluster
   const int new_cluster_idx = flop_clusters_.size();
@@ -5599,19 +6527,33 @@ AggloCluster::mergeClusters(const Edge& edge, bool verbose)
     std::cout << "          R-Tree: Skipped (empty region - won't be discoverable!)" << std::endl;
   }
 
-  odb::dbMaster* master1 = getClusterMaster(c1);
-  odb::dbMaster* master2 = getClusterMaster(c2);
   odb::dbMaster* merged_master = getClusterMaster(new_cluster);
+  const Point merged_pos(std::lround(new_cluster.curr_pt_.x), std::lround(new_cluster.curr_pt_.y));
+
+  if (verbose) {
+    std::cout << "          Masters: "
+              << "C1=" << (master1 ? master1->getName() : "NULL")
+              << ", C2=" << (master2 ? master2->getName() : "NULL")
+              << ", Merged=" << (merged_master ? merged_master->getName() : "NULL")
+              << std::endl;
+  }
 
   if (master1 && master2 && merged_master) {
-    const Point c1_pos(std::lround(c1.curr_pt_.x), std::lround(c1.curr_pt_.y));
-    const Point c2_pos(std::lround(c2.curr_pt_.x), std::lround(c2.curr_pt_.y));
-    const Point merged_pos(std::lround(new_cluster.curr_pt_.x), std::lround(new_cluster.curr_pt_.y));
+    try {
+      // Double-check masters are valid before calling applyMerge
+      if (master1->getWidth() > 0 && master2->getWidth() > 0 && merged_master->getWidth() > 0) {
+        virtual_bin_grid_.applyMerge(master1, c1_pos, master2, c2_pos, merged_master, merged_pos);
 
-    virtual_bin_grid_.applyMerge(master1, c1_pos, master2, c2_pos, merged_master, merged_pos);
-
-    if (verbose && virtual_bin_grid_.checkOverflow()) {
-      std::cout << "          WARNING: Density overflow detected after merge (unexpected)" << std::endl;
+        if (verbose && virtual_bin_grid_.checkOverflow()) {
+          std::cout << "          WARNING: Density overflow detected after merge (unexpected)" << std::endl;
+        }
+      } else if (verbose) {
+        std::cout << "          WARNING: Invalid master dimensions detected, skipping density update" << std::endl;
+      }
+    } catch (...) {
+      if (verbose) {
+        std::cout << "          WARNING: Exception during density update, skipping" << std::endl;
+      }
     }
   } else if (verbose) {
     std::cout << "          WARNING: Missing master information for density update" << std::endl;
